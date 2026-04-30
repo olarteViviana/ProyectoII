@@ -1,0 +1,21 @@
+[dataset]
+kaggle_slug = "odins0n/ucf-crime-dataset"
+raw_dir = "data/raw"
+manifest_path = "data/processed/manifest.csv"
+
+[preprocessing]
+image_size = 64
+color_mode = "rgb"
+test_size = 0.2
+random_state = 42
+
+[model]
+output_path = "models/ucf_crime_baseline.joblib"
+max_iter = 300
+class_weight = "balanced"
+max_train_samples = 5000
+max_test_samples = 1000
+
+[reports]
+classification_report = "reports/classification_report.txt"
+confusion_matrix = "reports/confusion_matrix.csv"

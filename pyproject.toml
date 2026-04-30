@@ -1,13 +1,27 @@
 [project]
-name = "proyectoii"
+name = "ucf-crime-recognition"
 version = "0.1.0"
 requires-python = ">=3.13"
 dependencies = [
     "certifi>=2026.4.22",
-    "ipykernel>=7.2.0",
-    "jupyter>=1.1.1",
+    "joblib>=1.5.2",
+    "kagglehub>=0.3.13",
     "matplotlib>=3.10.9",
+    "numpy>=2.3.5",
     "pandas>=3.0.2",
-    "seaborn>=0.13.2",
-    "ucimlrepo>=0.0.7",
+    "pillow>=12.0.0",
+    "scikit-learn>=1.8.0",
 ]
+
+[project.scripts]
+ucf-download = "ucf_crime_recognition.download:main"
+ucf-manifest = "ucf_crime_recognition.manifest:main"
+ucf-train = "ucf_crime_recognition.train:main"
+ucf-predict = "ucf_crime_recognition.predict:main"
+
+[build-system]
+requires = ["setuptools>=80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

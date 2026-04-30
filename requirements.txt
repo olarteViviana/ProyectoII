@@ -1,4 +1,8 @@
-ucimlrepo
+kagglehub
 pandas
+numpy
+pillow
+scikit-learn
+matplotlib
+joblib
 certifi
-jupyter

@@ -3,5 +3,13 @@ __pycache__/
 .venv/
 .env
 .jupyter/
+.uv-cache/
+*.egg-info/
+data/raw/
+data/processed/
+models/*
+reports/*
+!models/.gitkeep
+!reports/.gitkeep
 *.pyc
 .DS_Store
