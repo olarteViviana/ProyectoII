@@ -5,11 +5,17 @@ Pipeline inicial para clasificar imagenes del dataset **UCF Crime Dataset** de K
 El proyecto reemplaza el notebook anterior por una estructura reproducible:
 
 - `configs/pipeline.toml`: parametros del dataset, preprocesamiento y modelo.
-- `src/ucf_crime_recognition/`: codigo fuente del pipeline.
+- `src/ucf_crime_recognition/config/`: configuracion, rutas y MLflow.
+- `src/ucf_crime_recognition/data/`: descarga, manifiesto, loaders y validaciones.
+- `src/ucf_crime_recognition/features/`: transformacion de imagenes a features.
+- `src/ucf_crime_recognition/models/`: modelos candidatos, entrenamiento y registry.
+- `src/ucf_crime_recognition/pipeline.py`: flow de Prefect.
 - `scripts/`: entradas simples para ejecutar cada paso.
 - `data/`: datos locales ignorados por Git.
 - `models/`: modelos entrenados ignorados por Git.
 - `reports/`: metricas y reportes ignorados por Git.
+
+La arquitectura sigue el estilo del proyecto `MLOps_UdM/03-Orchestration/Prefect-pipelines`: un `pipeline.py` orquesta y el codigo de negocio vive en paquetes especializados.
 
 ## 1. Instalar dependencias
 
@@ -51,17 +57,78 @@ El manifiesto queda en `data/processed/manifest.csv` con columnas como:
 - `label`
 - `split`
 
-## 4. Entrenar un modelo base
+## 4. Ejecutar pipeline con Prefect + MLflow
+
+El proyecto puede entrenar varios modelos candidatos y escoger el mejor usando MLflow para tracking:
+
+- `logistic_regression`
+- `linear_svm`
+- `random_forest`
+
+La búsqueda de hiperparámetros se hace con Optuna sobre una validación interna, y el test final se deja solo para la evaluación del modelo seleccionado.
+
+Prefect orquesta los pasos del flujo:
+
+```bash
+uv run ucf-flow --rebuild-manifest
+```
+
+Si tambien quieres descargar el dataset desde el flow:
+
+```bash
+uv run ucf-flow --download --rebuild-manifest
+```
+
+El mejor modelo se escoge por `f1_macro`, configurado en `configs/pipeline.toml`.
+
+Para mejorar `f1_macro`, puedes ajustar rapidamente en `configs/pipeline.toml`:
+
+- `preprocessing.image_size`
+- `model.max_train_samples`, `model.max_validation_samples`, `model.max_test_samples`
+- `model.min_train_samples_per_class`, `model.max_train_samples_per_class`
+- `optuna.n_trials`, `optuna.timeout_seconds`
+
+## 5. Ver experimentos en MLflow
+
+El tracking local queda en `mlflow.db`. Para abrir la interfaz:
+
+```bash
+uv run mlflow ui --backend-store-uri sqlite:///mlflow.db
+```
+
+Luego abre:
+
+```text
+http://localhost:5000
+```
+
+## 6. Entrenar sin Prefect
 
 ```bash
 uv run python scripts/train_model.py
 ```
 
-El baseline carga las imagenes, las redimensiona, aplana pixeles normalizados y entrena una regresion logistica multiclase.
+Este comando tambien registra experimentos en MLflow y compara los modelos candidatos.
 Por defecto usa una muestra limitada (`max_train_samples` y `max_test_samples`) para poder validar el flujo sin consumir demasiada memoria.
 
-## 5. Predecir una imagen
+## 7. Predecir una imagen
 
 ```bash
 uv run python scripts/predict_image.py ruta/a/imagen.png
 ```
+
+## 8. Servir un deployment de Prefect
+
+```bash
+uv run python deploy.py
+```
+
+El deployment queda programado diariamente a las 2:00 AM.
+
+## 9. Abrir la interfaz SaaS
+
+```bash
+uv run streamlit run streamlit_app.py
+```
+
+La interfaz permite subir una imagen o un video, mostrar el triage del incidente, revisar el resumen del entrenamiento y leer el reporte de clasificación.

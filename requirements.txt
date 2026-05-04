@@ -1,8 +1,10 @@
 kagglehub
-pandas
+pandas>=2.3,<3
 numpy
 pillow
 scikit-learn
 matplotlib
 joblib
+mlflow
+prefect
 certifi

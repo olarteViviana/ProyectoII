@@ -11,5 +11,9 @@ models/*
 reports/*
 !models/.gitkeep
 !reports/.gitkeep
+mlruns/
+mlartifacts/
+mlflow.db
+prefect_run_id.txt
 *.pyc
 .DS_Store

@@ -4,18 +4,43 @@ raw_dir = "data/raw"
 manifest_path = "data/processed/manifest.csv"
 
 [preprocessing]
-image_size = 64
+image_size = 96
 color_mode = "rgb"
 test_size = 0.2
+validation_size = 0.25
 random_state = 42
 
 [model]
 output_path = "models/ucf_crime_baseline.joblib"
 max_iter = 300
 class_weight = "balanced"
-max_train_samples = 5000
-max_test_samples = 1000
+max_train_samples = 6000
+max_validation_samples = 800
+max_test_samples = 800
+min_train_samples_per_class = 150
+max_train_samples_per_class = 500
+candidate_models = [
+    "logistic_regression",
+    "linear_svm",
+    "extra_trees",
+    "random_forest",
+]
+selection_metric = "f1_macro"
 
 [reports]
 classification_report = "reports/classification_report.txt"
 confusion_matrix = "reports/confusion_matrix.csv"
+experiment_summary = "reports/experiment_summary.csv"
+
+[optuna]
+enabled = true
+n_trials = 48
+timeout_seconds = 1800
+
+[mlflow]
+tracking_uri = "sqlite:///mlflow.db"
+experiment_name = "ucf-crime-recognition"
+
+[registry]
+enabled = true
+model_name = "ucf-crime-image-classifier"
