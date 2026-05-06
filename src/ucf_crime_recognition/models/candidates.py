@@ -8,6 +8,7 @@ from sklearn.base import BaseEstimator, ClassifierMixin, clone
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.ensemble import ExtraTreesClassifier
 from sklearn.linear_model import LogisticRegression
+from sklearn.multioutput import MultiOutputClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import LinearSVC
@@ -119,61 +120,66 @@ def build_model(model_name: str, config: dict, params: dict[str, Any] | None = N
     max_iter = config["model"]["max_iter"]
     class_weight = config["model"]["class_weight"]
     random_state = config["preprocessing"]["random_state"]
+    multi_output = bool(config["model"].get("multi_output", False))
+
+    def wrap_classifier(classifier):
+        if multi_output:
+            return MultiOutputClassifier(classifier, n_jobs=-1)
+        return RiskAwareClassifier(
+            classifier,
+            normal_switch_ratio=params.get("normal_switch_ratio", 0.9),
+        )
 
     if model_name == "logistic_regression":
-        classifier = RiskAwareClassifier(
+        classifier = wrap_classifier(
             LogisticRegression(
-            C=params.get("C", 1.0),
-            max_iter=params.get("max_iter", max_iter),
-            solver=params.get("solver", "lbfgs"),
-            class_weight=class_weight,
-            random_state=random_state,
-            ),
-            normal_switch_ratio=params.get("normal_switch_ratio", 0.9),
+                C=params.get("C", 1.0),
+                max_iter=params.get("max_iter", max_iter),
+                solver=params.get("solver", "lbfgs"),
+                class_weight=class_weight,
+                random_state=random_state,
+            )
         )
         return Pipeline([("scaler", StandardScaler()), ("classifier", classifier)])
 
     if model_name == "linear_svm":
-        classifier = RiskAwareClassifier(
+        classifier = wrap_classifier(
             LinearSVC(
                 C=params.get("C", 1.0),
                 max_iter=params.get("max_iter", max_iter),
                 class_weight=class_weight,
                 random_state=random_state,
-            ),
-            normal_switch_ratio=params.get("normal_switch_ratio", 0.9),
+            )
         )
         return Pipeline([("scaler", StandardScaler()), ("classifier", classifier)])
 
     if model_name == "random_forest":
-        classifier = RiskAwareClassifier(
+        classifier = wrap_classifier(
             RandomForestClassifier(
-            n_estimators=params.get("n_estimators", 150),
-            max_depth=params.get("max_depth"),
-            min_samples_split=params.get("min_samples_split", 2),
-            min_samples_leaf=params.get("min_samples_leaf", 1),
-            max_features=params.get("max_features", "sqrt"),
-            class_weight=class_weight,
-            random_state=random_state,
-            n_jobs=-1,
-            ),
-            normal_switch_ratio=params.get("normal_switch_ratio", 0.9),
+                n_estimators=params.get("n_estimators", 150),
+                max_depth=params.get("max_depth"),
+                min_samples_split=params.get("min_samples_split", 2),
+                min_samples_leaf=params.get("min_samples_leaf", 1),
+                max_features=params.get("max_features", "sqrt"),
+                class_weight=class_weight,
+                random_state=random_state,
+                n_jobs=-1,
+            )
         )
         return Pipeline([("classifier", classifier)])
 
     if model_name == "extra_trees":
-        classifier = RiskAwareClassifier(
+        classifier = wrap_classifier(
             ExtraTreesClassifier(
-            n_estimators=params.get("n_estimators", 250),
-            max_depth=params.get("max_depth"),
-            min_samples_split=params.get("min_samples_split", 2),
-            min_samples_leaf=params.get("min_samples_leaf", 1),
-            max_features=params.get("max_features", "sqrt"),
-            class_weight=class_weight,
-            random_state=random_state,
-            n_jobs=-1,
-            ),
-            normal_switch_ratio=params.get("normal_switch_ratio", 0.9),
+                n_estimators=params.get("n_estimators", 250),
+                max_depth=params.get("max_depth"),
+                min_samples_split=params.get("min_samples_split", 2),
+                min_samples_leaf=params.get("min_samples_leaf", 1),
+                max_features=params.get("max_features", "sqrt"),
+                class_weight=class_weight,
+                random_state=random_state,
+                n_jobs=-1,
+            )
         )
         return Pipeline([("classifier", classifier)])
 

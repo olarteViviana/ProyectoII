@@ -12,6 +12,7 @@ random_state = 42
 
 [model]
 output_path = "models/ucf_crime_baseline.joblib"
+multi_output = true
 max_iter = 300
 class_weight = "balanced"
 max_train_samples = 6000
@@ -26,6 +27,11 @@ candidate_models = [
     "random_forest",
 ]
 selection_metric = "f1_macro"
+
+[model.threshold_search]
+min = 0.05
+max = 0.95
+steps = 19
 
 [reports]
 classification_report = "reports/classification_report.txt"
