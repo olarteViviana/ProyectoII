@@ -7,6 +7,9 @@ import cv2
 import numpy as np
 import pandas as pd
 from PIL import Image
+import torch
+import torchvision.models as models
+import torchvision.transforms as transforms
 
 
 @lru_cache(maxsize=32)
@@ -63,6 +66,38 @@ def _spatial_thumbnail(image: np.ndarray, size: int = 16) -> np.ndarray:
     return thumbnail.reshape(-1).astype(np.float32)
 
 
+@lru_cache(maxsize=1)
+def _get_resnet50_model():
+    """Load pretrained ResNet-50 and remove the classification head."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
+    model = torch.nn.Sequential(*list(model.children())[:-1])  # Remove final FC layer
+    model.to(device)
+    model.eval()
+    return model, device
+
+
+def load_image_vector_pretrained(image_path: str | Path, embedding_dim: int = 2048) -> np.ndarray:
+    """Extract ResNet-50 embeddings from an image (2048-dim feature vector)."""
+    model, device = _get_resnet50_model()
+    
+    preprocess = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+    
+    with Image.open(image_path) as image:
+        image = image.convert("RGB")
+        tensor = preprocess(image).unsqueeze(0).to(device)
+    
+    with torch.no_grad():
+        embedding = model(tensor).squeeze().cpu().numpy()
+    
+    return embedding.astype(np.float32)
+
+
 def load_image_vector(image_path: str | Path, image_size: int, color_mode: str) -> np.ndarray:
     mode = "RGB" if color_mode == "rgb" else "L"
 
@@ -100,10 +135,38 @@ def build_feature_matrix(
     manifest: pd.DataFrame,
     image_size: int,
     color_mode: str,
+    use_pretrained: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
-    features = [
-        load_image_vector(row.path, image_size=image_size, color_mode=color_mode)
-        for row in manifest.itertuples(index=False)
-    ]
-    labels = manifest["label"].to_numpy()
-    return np.vstack(features), labels
+    """
+    Build feature matrix from images.
+    
+    Args:
+        manifest: DataFrame with 'path' and 'label' columns
+        image_size: Size for traditional HOG features (ignored if use_pretrained=True)
+        color_mode: 'rgb' or 'grayscale' (ignored if use_pretrained=True)
+        use_pretrained: If True, use ResNet-50 embeddings (2048-dim); else use HOG+color+edge
+    
+    Returns:
+        Tuple of (features array, labels array)
+    """
+    if use_pretrained:
+        print("Loading ResNet-50 pretrained model...")
+        features = []
+        for idx, row in enumerate(manifest.itertuples(index=False)):
+            try:
+                embedding = load_image_vector_pretrained(row.path)
+                features.append(embedding)
+                if (idx + 1) % 50 == 0:
+                    print(f"  Processed {idx + 1}/{len(manifest)} images")
+            except Exception as e:
+                print(f"  Warning: failed to process {row.path}: {e}")
+                features.append(np.zeros(2048, dtype=np.float32))
+        labels = manifest["label"].to_numpy()
+        return np.vstack(features), labels
+    else:
+        features = [
+            load_image_vector(row.path, image_size=image_size, color_mode=color_mode)
+            for row in manifest.itertuples(index=False)
+        ]
+        labels = manifest["label"].to_numpy()
+        return np.vstack(features), labels
