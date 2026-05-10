@@ -157,6 +157,8 @@ Indica el dataset de Kaggle, la ruta local para datos crudos y la ruta donde se 
 [preprocessing]
 image_size = 96
 color_mode = "rgb"
+feature_extractor = "vgg16"
+embedding_cache_dir = "data/processed/embeddings"
 test_size = 0.2
 validation_size = 0.25
 random_state = 42
@@ -164,6 +166,8 @@ random_state = 42
 
 - `image_size`: tamano usado si se extraen caracteristicas tradicionales.
 - `color_mode`: modo de color para la extraccion tradicional.
+- `feature_extractor`: extractor CNN preentrenado usado para embeddings. Puede ser `resnet50` o `vgg16`.
+- `embedding_cache_dir`: carpeta donde se guardan embeddings para evitar recalcularlos en cada entrenamiento.
 - `test_size`: proporcion usada si el dataset no trae split definido.
 - `validation_size`: proporcion del entrenamiento reservada para validacion interna.
 - `random_state`: semilla para reproducibilidad.
@@ -176,18 +180,18 @@ output_path = "models/ucf_crime_baseline.joblib"
 multi_output = true
 max_iter = 300
 class_weight = "balanced"
-max_train_samples = 6000
-max_validation_samples = 800
-max_test_samples = 800
-min_train_samples_per_class = 150
-max_train_samples_per_class = 500
+max_train_samples = 10000
+max_validation_samples = 1200
+max_test_samples = 1200
+min_train_samples_per_class = 250
+max_train_samples_per_class = 800
 candidate_models = [
     "logistic_regression",
     "linear_svm",
     "extra_trees",
     "random_forest",
 ]
-selection_metric = "f1_macro"
+selection_metric = "risk_f1_macro"
 ```
 
 Puntos importantes:
@@ -196,7 +200,7 @@ Puntos importantes:
 - `class_weight = "balanced"` ayuda a penalizar errores en clases minoritarias.
 - `max_*_samples` limita el tamano para que el pipeline sea ejecutable localmente.
 - `min_train_samples_per_class` y `max_train_samples_per_class` controlan rebalanceo.
-- `selection_metric = "f1_macro"` busca que todas las clases tengan peso similar, incluso las raras.
+- `selection_metric = "risk_f1_macro"` selecciona el modelo por desempeno en clases de riesgo, excluyendo `NormalVideos`.
 
 ### 4.4 Busqueda de umbrales
 
@@ -331,9 +335,9 @@ Esto evita entrenar con datos incompletos o mal estructurados.
 `sample_manifest()` reduce el numero de muestras cuando se definen limites como:
 
 ```toml
-max_train_samples = 6000
-max_validation_samples = 800
-max_test_samples = 800
+max_train_samples = 10000
+max_validation_samples = 1200
+max_test_samples = 1200
 ```
 
 El muestreo intenta preservar proporcion por etiqueta agrupando por `label`.
@@ -374,24 +378,34 @@ Esto es mejor que balancear por el texto completo de `label`, porque `Robbery|Fi
 
 El modulo `src/ucf_crime_recognition/features/engineering.py` convierte imagenes en vectores numericos.
 
-### 7.1 Modo principal: embeddings ResNet-50
+### 7.1 Modo principal: embeddings CNN preentrenados
 
-Por defecto `build_feature_matrix(..., use_pretrained=True)` usa ResNet-50 preentrenada en ImageNet.
+Por defecto `build_feature_matrix(..., use_pretrained=True)` usa un extractor CNN preentrenado. El extractor se configura en `configs/pipeline.toml`:
+
+```toml
+[preprocessing]
+feature_extractor = "vgg16"
+```
+
+Actualmente el codigo permite comparar:
+
+- `resnet50`: ResNet-50 preentrenada en ImageNet, salida de 2048 dimensiones.
+- `vgg16`: VGG16 preentrenada en ImageNet, salida de 4096 dimensiones.
 
 Flujo:
 
-1. carga ResNet-50 con `torchvision.models.resnet50`;
+1. carga el extractor seleccionado con `torchvision.models`;
 2. elimina la capa final de clasificacion;
 3. deja la red como extractor de embeddings;
 4. convierte cada imagen a RGB;
 5. redimensiona a 256;
 6. recorta centro a 224x224;
 7. normaliza con medias y desviaciones de ImageNet;
-8. obtiene un vector de 2048 dimensiones.
+8. obtiene un vector numerico que resume la imagen.
 
 Justificacion:
 
-- ResNet-50 ya aprendio representaciones visuales generales;
+- la CNN preentrenada ya aprendio representaciones visuales generales;
 - reduce la necesidad de entrenar una CNN completa desde cero;
 - permite usar clasificadores tradicionales sobre embeddings;
 - es razonable cuando el dataset local es limitado o desbalanceado.
@@ -399,10 +413,38 @@ Justificacion:
 Limitacion:
 
 - ImageNet no esta especializado en vigilancia o eventos criminales;
+- ImageNet tampoco esta especializado en relaciones humanas ni interacciones persona-persona;
 - una imagen aislada puede no contener suficiente contexto temporal;
 - el dominio visual de UCF Crime puede diferir de ImageNet.
 
-### 7.2 Modo alternativo: features tradicionales
+### 7.2 Retroalimentacion del profesor: ResNet, VGG16 y COCO
+
+La observacion del profesor es tecnica y valida: ResNet-50 con pesos de ImageNet puede no ser el mejor extractor para este problema porque ImageNet se centra en reconocimiento de objetos y escenas generales, no en relaciones humanas, violencia, robo o interacciones entre personas.
+
+VGG16 tambien suele usarse con pesos de ImageNet. Por eso cambiar ResNet-50 por VGG16 no garantiza resolver el problema de fondo; mas bien sirve como experimento comparativo para saber si otra arquitectura visual produce embeddings mas utiles para los clasificadores del proyecto.
+
+COCO es una linea de mejora distinta. Un modelo entrenado en COCO normalmente se usa para deteccion de objetos, por ejemplo:
+
+- personas;
+- carros;
+- bolsos;
+- mochilas;
+- botellas;
+- celulares u otros objetos;
+- posiciones aproximadas por bounding boxes.
+
+Esto puede ser mas relevante para vigilancia porque permite construir caracteristicas como:
+
+- numero de personas detectadas;
+- distancia entre personas;
+- presencia de objetos transportables;
+- cercania entre persona y mostrador;
+- persistencia de personas u objetos a lo largo del video;
+- relacion persona-objeto.
+
+Sin embargo, un detector COCO no clasifica directamente `Robbery` o `Fighting`. Proporciona detecciones intermedias. Para aprovecharlo bien, el pipeline deberia extraer features de objetos/personas y luego entrenar otro clasificador sobre esas features, posiblemente combinadas con embeddings CNN.
+
+### 7.3 Modo alternativo: features tradicionales
 
 `load_image_vector()` extrae:
 
@@ -412,13 +454,30 @@ Limitacion:
 - densidad de bordes con Canny;
 - miniatura espacial.
 
-Este modo sirve como alternativa cuando no se quiere usar PyTorch/ResNet, pero usualmente los embeddings profundos deberian capturar informacion mas rica.
+Este modo sirve como alternativa cuando no se quiere usar PyTorch/CNNs preentrenadas, pero usualmente los embeddings profundos deberian capturar informacion mas rica.
+
+### 7.4 Cache de embeddings
+
+Extraer embeddings con ResNet-50 o VGG16 es costoso porque cada imagen debe pasar por una red neuronal profunda. Para poder aumentar datos de entrenamiento y repetir experimentos sin recalcular todo, el proyecto usa cache en:
+
+```toml
+embedding_cache_dir = "data/processed/embeddings"
+```
+
+La cache guarda un archivo `.npy` por imagen y extractor. El identificador incluye:
+
+- ruta de la imagen;
+- extractor usado (`resnet50` o `vgg16`);
+- fecha de modificacion del archivo;
+- tamano del archivo.
+
+Esto permite que, si se corre de nuevo el pipeline con el mismo extractor y las mismas imagenes, se reutilicen los embeddings ya calculados. Si la imagen cambia, la cache se invalida automaticamente porque cambia su metadata.
 
 ## 8. Modelos candidatos y justificacion
 
 Los modelos estan en `src/ucf_crime_recognition/models/candidates.py`.
 
-Todos reciben como entrada vectores numericos, normalmente embeddings ResNet-50 de 2048 dimensiones.
+Todos reciben como entrada vectores numericos, normalmente embeddings CNN preentrenados. Si `feature_extractor = "resnet50"`, la entrada tiene 2048 dimensiones. Si `feature_extractor = "vgg16"`, la entrada tiene 4096 dimensiones.
 
 ### 8.1 Logistic Regression
 
@@ -554,7 +613,7 @@ La metrica usada es:
 selection_metric = "f1_macro"
 ```
 
-### 9.1 Por que F1 macro
+### 9.1 Por que usar F1 macro y risk_f1_macro
 
 F1 macro calcula F1 por clase y luego promedia sin ponderar por soporte. Esto es importante porque el dataset esta desbalanceado. Si se usara accuracy, `NormalVideos` dominaria la evaluacion.
 
@@ -568,6 +627,16 @@ Fighting:       9 muestras de 800
 ```
 
 Un modelo podria obtener accuracy aparentemente aceptable prediciendo casi todo como normal, pero seria inutil para detectar clases raras. F1 macro castiga ese comportamiento.
+
+Como mejora posterior, el proyecto tambien calcula `risk_f1_macro`, que es un F1 macro restringido a las clases diferentes de `NormalVideos`. Esta metrica es mas coherente con el objetivo operativo de vigilancia, porque el interes principal no es reconocer normalidad sino detectar eventos de riesgo.
+
+Actualmente el config usa:
+
+```toml
+selection_metric = "risk_f1_macro"
+```
+
+Esto obliga a Optuna a preferir modelos que funcionen mejor en clases como `Robbery`, `Fighting`, `Burglary`, `Shooting`, etc., aunque `NormalVideos` sea la clase con mas ejemplos.
 
 ### 9.2 Busqueda de thresholds por clase
 
@@ -1023,7 +1092,7 @@ Definidas en `pyproject.toml`:
 - `numpy`: arreglos numericos.
 - `pillow`: lectura de imagenes.
 - `opencv-python-headless`: procesamiento de imagenes y video.
-- `torch` y `torchvision`: ResNet-50 preentrenada.
+- `torch` y `torchvision`: extractores CNN preentrenados como ResNet-50 y VGG16.
 - `scikit-learn`: modelos, metricas, pipelines y `MultiOutputClassifier`.
 - `optuna`: busqueda de hiperparametros.
 - `mlflow`: tracking y registry.
@@ -1040,7 +1109,7 @@ Definidas en `pyproject.toml`:
 - Pipeline reproducible con configuracion centralizada.
 - Integracion con Prefect y MLflow.
 - Comparacion automatica de modelos candidatos.
-- Uso de embeddings ResNet-50 en vez de pixeles crudos.
+- Uso de embeddings CNN preentrenados en vez de pixeles crudos.
 - Soporte multi-etiqueta con `MultiOutputClassifier`.
 - Balanceo multilabel-aware.
 - Thresholds por clase optimizados en validacion.
@@ -1054,7 +1123,7 @@ Definidas en `pyproject.toml`:
 - `MultiOutputClassifier` aprende cada etiqueta de forma independiente.
 - Si el manifest no contiene filas realmente multi-etiqueta, el modo multi-output no aprovecha todo su potencial.
 - Clases raras tienen muy poco soporte, lo que reduce F1 macro.
-- ResNet-50 preentrenada en ImageNet puede no capturar bien eventos de vigilancia.
+- Los extractores preentrenados en ImageNet, como ResNet-50 o VGG16, pueden no capturar bien relaciones humanas ni eventos de vigilancia.
 - El split train/test puede tener distribuciones desbalanceadas.
 - La validacion temporal depende de thresholds manuales en las politicas de video.
 
@@ -1068,6 +1137,7 @@ Definidas en `pyproject.toml`:
 4. Preguntar si el profesor prefiere mejorar recall de eventos raros aunque aumenten falsos positivos.
 5. Preguntar si se debe usar un modelo temporal como LSTM, GRU, 3D CNN, TimeSformer o algun agregador sobre embeddings por frame.
 6. Preguntar si `NormalVideos` debe modelarse como una etiqueta mas o como ausencia de eventos.
+7. Preguntar si conviene incorporar un detector entrenado en COCO para extraer personas, objetos y relaciones espaciales.
 
 ### 20.2 Mejoras recomendadas
 
@@ -1080,13 +1150,15 @@ Definidas en `pyproject.toml`:
 7. Evaluar PR-AUC por clase.
 8. Ajustar thresholds segun costo operativo de falso positivo vs falso negativo.
 9. Recolectar o sintetizar mas ejemplos de clases raras.
-10. Probar embeddings de modelos visuales mas modernos si el entorno lo permite.
+10. Comparar `feature_extractor = "resnet50"` contra `feature_extractor = "vgg16"` usando exactamente el mismo pipeline.
+11. Probar features basadas en COCO: conteo de personas, objetos, cajas delimitadoras y relaciones persona-objeto.
+12. Probar embeddings de modelos visuales mas modernos si el entorno lo permite.
 
 ## 21. Como explicar el proyecto oralmente
 
 Una forma clara de presentarlo:
 
-> El proyecto toma el dataset UCF Crime, construye un manifiesto reproducible de imagenes, extrae embeddings visuales con ResNet-50 y entrena varios clasificadores tradicionales sobre esos embeddings. El entrenamiento esta orquestado con Prefect y cada experimento queda registrado en MLflow. Como los videos pueden contener multiples eventos simultaneos, el sistema fue adaptado a clasificacion multi-etiqueta usando `MultiOutputClassifier`. Para combatir el desbalance, se aplican `class_weight`, rebalanceo por etiqueta y thresholds optimizados por clase. Finalmente, el modelo se puede usar en imagenes o en videos mediante muestreo de frames y politicas temporales de agregacion.
+> El proyecto toma el dataset UCF Crime, construye un manifiesto reproducible de imagenes, extrae embeddings visuales con un extractor CNN preentrenado configurable, por ejemplo ResNet-50 o VGG16, y entrena varios clasificadores tradicionales sobre esos embeddings. El entrenamiento esta orquestado con Prefect y cada experimento queda registrado en MLflow. Como los videos pueden contener multiples eventos simultaneos, el sistema fue adaptado a clasificacion multi-etiqueta usando `MultiOutputClassifier`. Para combatir el desbalance, se aplican `class_weight`, rebalanceo por etiqueta y thresholds optimizados por clase. La retroalimentacion actual es evaluar si ImageNet es suficiente o si conviene incorporar features de personas/objetos con modelos entrenados en COCO. Finalmente, el modelo se puede usar en imagenes o en videos mediante muestreo de frames y politicas temporales de agregacion.
 
 ## 22. Comandos utiles
 
@@ -1154,6 +1226,6 @@ uv run python -m ucf_crime_recognition.tools.validate_temporal_policies data/a/e
 
 El proyecto esta construido como una solucion MLOps local completa: no solo entrena un modelo, sino que gestiona configuracion, datos, features, experimentos, seleccion de modelo, registro, inferencia y visualizacion.
 
-La decision de usar modelos tradicionales sobre embeddings ResNet-50 es una estrategia razonable para un proyecto academico porque reduce el costo de entrenamiento y permite comparar modelos con Optuna. La adicion de `MultiOutputClassifier` responde al problema real de que un video puede contener multiples eventos. Sin embargo, el desempeno depende fuertemente de la calidad del manifest, el balance de clases y la existencia de etiquetas multi-etiqueta reales.
+La decision de usar modelos tradicionales sobre embeddings CNN preentrenados es una estrategia razonable para un proyecto academico porque reduce el costo de entrenamiento y permite comparar modelos con Optuna. La adicion de `MultiOutputClassifier` responde al problema real de que un video puede contener multiples eventos. Sin embargo, el desempeno depende fuertemente de la calidad del manifest, el balance de clases, la existencia de etiquetas multi-etiqueta reales y la pertinencia del extractor visual frente al dominio de vigilancia.
 
 La principal conversacion tecnica pendiente con el profesor deberia enfocarse en la unidad correcta de aprendizaje: si el problema se debe resolver por frame, por video o por secuencia temporal. Si el objetivo final es video, el pipeline actual es una buena base, pero el siguiente salto metodologico seria incorporar informacion temporal de forma mas directa.

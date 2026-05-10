@@ -144,12 +144,15 @@ def predict_image_details(image_path: str | Path, config_path: str | Path | None
 
     model = joblib.load(model_path)
     
-    # Detect if model was trained with embeddings (2048 features) or HOG (variable)
+    feature_extractor = getattr(model, "feature_extractor_", config["preprocessing"].get("feature_extractor", None))
     expected_features = getattr(model, "n_features_in_", None)
-    use_embeddings = expected_features == 2048 if expected_features else False
-    
-    if use_embeddings:
-        features = load_image_vector_pretrained(image_path).reshape(1, -1)
+
+    if feature_extractor in {"resnet50", "vgg16"}:
+        features = load_image_vector_pretrained(image_path, feature_extractor=feature_extractor).reshape(1, -1)
+    elif expected_features == 2048:
+        features = load_image_vector_pretrained(image_path, feature_extractor="resnet50").reshape(1, -1)
+    elif expected_features == 4096:
+        features = load_image_vector_pretrained(image_path, feature_extractor="vgg16").reshape(1, -1)
     else:
         features = load_image_vector(image_path, image_size, color_mode).reshape(1, -1)
 

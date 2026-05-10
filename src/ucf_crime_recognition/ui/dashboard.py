@@ -84,6 +84,30 @@ def _incident_summary(label: str, confidence: float) -> str:
     )
 
 
+def _format_percent(value: float) -> str:
+    return f"{float(value):.1%}"
+
+
+def _risk_signal_from_scores(class_scores: dict) -> tuple[str, float]:
+    risk_scores = {
+        str(class_name): float(probability)
+        for class_name, probability in class_scores.items()
+        if str(class_name) != "NormalVideos"
+    }
+    if not risk_scores:
+        return "N/D", 0.0
+
+    class_name = max(risk_scores, key=risk_scores.get)
+    return class_name, risk_scores[class_name]
+
+
+def _format_active_labels(prediction: dict) -> str:
+    labels = prediction.get("predictions")
+    if labels:
+        return " | ".join(str(label) for label in labels)
+    return str(prediction.get("prediction", ""))
+
+
 def _save_upload(uploaded_file) -> Path:
     suffix = Path(uploaded_file.name).suffix or ".png"
     temp_dir = Path(tempfile.mkdtemp(prefix="ucf-crime-ui-"))
@@ -165,6 +189,10 @@ def _aggregate_video_predictions(frame_results: list[dict]) -> dict:
         confidence = float(dominant_label["max_confidence"])
         class_summary = pd.DataFrame()
         top_alternative = None
+        probability_leader_label = label
+        probability_leader_value = confidence
+        decision_reason = "prediccion_frame"
+        decision_note = "La decisión se calculó por mayoría de predicciones en los frames muestreados."
     else:
         class_summary = (
             score_frame.groupby("class_name")
@@ -191,6 +219,11 @@ def _aggregate_video_predictions(frame_results: list[dict]) -> dict:
         label = str(best_row["class_name"])
         confidence = float(best_row["max_probability"])
         top_alternative = class_summary.iloc[1] if len(class_summary) > 1 else None
+        probability_leader = class_summary.sort_values("max_probability", ascending=False).iloc[0]
+        probability_leader_label = str(probability_leader["class_name"])
+        probability_leader_value = float(probability_leader["max_probability"])
+        decision_reason = "score_operativo"
+        decision_note = "La decisión usa score operativo: promedio, pico, persistencia y peso de riesgo por clase."
 
     if not class_summary.empty:
         normal_row = class_summary[class_summary["class_name"] == "NormalVideos"]
@@ -205,17 +238,35 @@ def _aggregate_video_predictions(frame_results: list[dict]) -> dict:
             if risk_peak >= 0.20 and risk_hits >= 2 and risk_score >= normal_score * 0.55:
                 label = str(risk_row["class_name"])
                 confidence = risk_peak
+                decision_reason = "prioridad_riesgo"
+                decision_note = (
+                    f"{label} no necesariamente tiene la mayor probabilidad bruta; se priorizó porque aparece "
+                    f"en {risk_hits} frames con señal de riesgo y su score operativo es cercano al de NormalVideos."
+                )
             elif label == "NormalVideos" and top_alternative is not None:
                 alternative_label = str(top_alternative["class_name"])
                 alternative_score = float(top_alternative["decision_score"])
                 if alternative_label != "NormalVideos" and alternative_score >= normal_score * 0.9:
                     label = alternative_label
                     confidence = float(top_alternative["max_probability"])
+                    decision_reason = "alternativa_cercana"
+                    decision_note = (
+                        f"{alternative_label} quedó muy cerca de NormalVideos en score operativo; "
+                        "se muestra como evento para revisión humana."
+                    )
 
     tier, score, recommendation = _risk_profile(label, confidence)
+    if not class_summary.empty:
+        class_summary = class_summary.copy()
+        class_summary["selected"] = class_summary["class_name"].eq(label)
+
     return {
         "prediction": label,
         "confidence": confidence,
+        "decision_reason": decision_reason,
+        "decision_note": decision_note,
+        "probability_leader": probability_leader_label,
+        "probability_leader_confidence": probability_leader_value,
         "tier": tier,
         "score": score,
         "recommendation": recommendation,
@@ -229,51 +280,77 @@ def _apply_styles() -> None:
         """
         <style>
         .stApp {
-            background:
-                radial-gradient(circle at top left, rgba(255, 206, 122, 0.18), transparent 28%),
-                radial-gradient(circle at top right, rgba(35, 74, 96, 0.18), transparent 24%),
-                linear-gradient(180deg, #07111f 0%, #0d1724 48%, #f5efe7 48%, #f7f1e8 100%);
-            color: #102132;
+            background: #f5f7fb;
+            color: #0f172a;
+        }
+        [data-testid="stHeader"] {
+            background: rgba(245, 247, 251, 0.92);
         }
         .hero {
-            padding: 2.2rem 2rem 1.6rem 2rem;
-            border-radius: 28px;
-            background: linear-gradient(135deg, rgba(10, 18, 31, 0.92), rgba(18, 39, 62, 0.9));
-            color: #fff6ea;
-            box-shadow: 0 24px 60px rgba(7, 17, 31, 0.22);
-            margin-bottom: 1.2rem;
+            padding: 1.35rem 1.5rem;
+            border-radius: 8px;
+            background: #101827;
+            color: #f8fafc;
+            border: 1px solid rgba(15, 23, 42, 0.12);
+            margin-bottom: 1rem;
         }
         .hero h1 {
             margin: 0;
-            font-size: 3rem;
-            letter-spacing: -0.04em;
+            font-size: 2rem;
+            letter-spacing: 0;
         }
         .hero p {
-            margin: 0.65rem 0 0 0;
+            margin: 0.45rem 0 0 0;
             max-width: 860px;
-            color: rgba(255, 246, 234, 0.84);
-            font-size: 1.02rem;
-            line-height: 1.6;
+            color: #cbd5e1;
+            font-size: 0.98rem;
+            line-height: 1.5;
         }
         .soft-card {
-            padding: 1.1rem 1.2rem;
-            border-radius: 22px;
-            background: rgba(255, 255, 255, 0.74);
-            border: 1px solid rgba(25, 37, 48, 0.08);
-            box-shadow: 0 18px 44px rgba(17, 28, 39, 0.08);
+            padding: 1rem;
+            border-radius: 8px;
+            background: #ffffff;
+            border: 1px solid #d8dee9;
+            box-shadow: 0 8px 24px rgba(15, 23, 42, 0.05);
+            color: #0f172a;
         }
         .small-label {
             text-transform: uppercase;
-            letter-spacing: 0.14em;
+            letter-spacing: 0.08em;
             font-size: 0.72rem;
             font-weight: 700;
-            color: #6a5a47;
+            color: #475569;
         }
         .business-note {
-            padding: 1rem 1.1rem;
-            border-left: 4px solid #b87333;
-            background: #fff9f2;
-            border-radius: 0 18px 18px 0;
+            padding: 0.9rem 1rem;
+            border-left: 4px solid #2563eb;
+            background: #eff6ff;
+            border-radius: 0 8px 8px 0;
+            color: #172554;
+        }
+        div[data-testid="stMetric"] {
+            background: #ffffff;
+            border: 1px solid #d8dee9;
+            border-radius: 8px;
+            padding: 0.8rem 0.9rem;
+        }
+        div[data-testid="stMetric"] label {
+            color: #475569;
+        }
+        div[data-testid="stMetricValue"] {
+            color: #0f172a;
+        }
+        .stDataFrame {
+            border: 1px solid #d8dee9;
+            border-radius: 8px;
+        }
+        .decision-note {
+            padding: 0.9rem 1rem;
+            border-radius: 8px;
+            background: #fff7ed;
+            border: 1px solid #fed7aa;
+            color: #7c2d12;
+            margin: 0.6rem 0 0.8rem 0;
         }
         </style>
         """,
@@ -313,14 +390,20 @@ def _render_experiment_panel(summary: pd.DataFrame | None, report_text: str | No
                         prediction = predict_image_details(frame["image_path"])
                         label = prediction["prediction"]
                         confidence = float(prediction["confidence"])
+                        class_scores = prediction.get("class_scores", {})
+                        risk_class, risk_probability = _risk_signal_from_scores(class_scores)
                         tier, score, recommendation = _risk_profile(label, confidence)
                         frame_results.append(
                             {
                                 "timestamp_s": round(frame["timestamp_seconds"], 2),
                                 "frame_index": frame["frame_index"],
                                 "prediction": label,
+                                "active_labels": _format_active_labels(prediction),
                                 "confidence": confidence,
-                                "class_scores": prediction.get("class_scores", {}),
+                                "normal_probability": float(class_scores.get("NormalVideos", 0.0)),
+                                "top_risk_class": risk_class,
+                                "top_risk_probability": risk_probability,
+                                "class_scores": class_scores,
                                 "tier": tier,
                                 "score": score,
                                 "recommendation": recommendation,
@@ -328,52 +411,122 @@ def _render_experiment_panel(summary: pd.DataFrame | None, report_text: str | No
                         )
 
                     aggregate = _aggregate_video_predictions(frame_results)
-                    m1, m2, m3 = st.columns(3)
-                    m1.metric("Evento dominante", aggregate["prediction"])
-                    m2.metric("Confianza pico", f"{aggregate['confidence']:.1%}")
-                    m3.metric("Nivel", aggregate["tier"])
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("Decisión operativa", aggregate["prediction"])
+                    m2.metric("Evidencia del evento", _format_percent(aggregate["confidence"]))
+                    m3.metric("Mayor probabilidad", aggregate["probability_leader"])
+                    m4.metric("Pico mayor", _format_percent(aggregate["probability_leader_confidence"]))
 
                     st.markdown(_incident_summary(aggregate["prediction"], aggregate["confidence"]))
-                    st.info(f"**Recomendación operativa:** {aggregate['recommendation']}")
+                    st.markdown(
+                        f"""
+                        <div class="decision-note">
+                        <strong>Por qué la decisión puede diferir del máximo bruto:</strong><br>
+                        {aggregate["decision_note"]}
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                    st.success(f"Recomendación operativa: {aggregate['recommendation']}")
 
                     if not aggregate["class_summary"].empty:
                         st.caption("Evidencia agregada por clase")
+                        display_summary = aggregate["class_summary"][
+                            [
+                                "selected",
+                                "class_name",
+                                "mean_probability",
+                                "max_probability",
+                                "frame_hits",
+                                "decision_score",
+                            ]
+                        ].rename(
+                            columns={
+                                "selected": "decisión",
+                                "class_name": "clase",
+                                "mean_probability": "prob. media",
+                                "max_probability": "prob. máxima",
+                                "frame_hits": "frames con señal",
+                                "decision_score": "score operativo",
+                            }
+                        )
+                        display_summary["decisión"] = display_summary["decisión"].map(
+                            {True: "Seleccionada", False: ""}
+                        )
+                        display_summary = display_summary.sort_values(
+                            ["decisión", "score operativo", "prob. máxima"],
+                            ascending=[False, False, False],
+                        )
                         st.dataframe(
-                            aggregate["class_summary"][
-                                ["class_name", "mean_probability", "max_probability", "frame_hits", "decision_score"]
-                            ],
-                            use_container_width=True,
+                            display_summary,
+                            width="stretch",
                             hide_index=True,
                         )
 
                     event_table = pd.DataFrame(frame_results)
-                    st.caption("Timeline de incidentes muestreados")
+                    st.caption("Timeline multi-etiqueta por frame")
                     st.dataframe(
-                        event_table[["timestamp_s", "prediction", "confidence", "tier", "score"]].sort_values(
-                            "timestamp_s"
+                        event_table[
+                            [
+                                "timestamp_s",
+                                "active_labels",
+                                "normal_probability",
+                                "top_risk_class",
+                                "top_risk_probability",
+                                "tier",
+                                "score",
+                            ]
+                        ]
+                        .rename(
+                            columns={
+                                "timestamp_s": "tiempo (s)",
+                                "active_labels": "etiquetas activas",
+                                "normal_probability": "score NormalVideos",
+                                "top_risk_class": "mayor riesgo",
+                                "top_risk_probability": "score mayor riesgo",
+                                "tier": "nivel",
+                                "score": "severidad",
+                            }
+                        )
+                        .sort_values("tiempo (s)"),
+                        width="stretch",
+                        hide_index=True,
+                    )
+
+                    key_moments = event_table.sort_values("top_risk_probability", ascending=False).head(3)
+                    st.caption("Momentos clave por señal de riesgo")
+                    st.dataframe(
+                        key_moments[
+                            [
+                                "timestamp_s",
+                                "top_risk_class",
+                                "top_risk_probability",
+                                "normal_probability",
+                                "active_labels",
+                                "recommendation",
+                            ]
+                        ].rename(
+                            columns={
+                                "timestamp_s": "tiempo (s)",
+                                "top_risk_class": "mayor riesgo",
+                                "top_risk_probability": "score riesgo",
+                                "normal_probability": "score NormalVideos",
+                                "active_labels": "etiquetas activas",
+                                "recommendation": "recomendación",
+                            }
                         ),
-                        use_container_width=True,
+                        width="stretch",
                         hide_index=True,
                     )
 
-                    key_moments = event_table.sort_values("confidence", ascending=False).head(3)
-                    st.caption("Momentos clave")
-                    st.dataframe(
-                        key_moments[["timestamp_s", "prediction", "confidence", "recommendation"]],
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-
-                    score_frame = event_table.groupby("prediction", as_index=False)["confidence"].mean().sort_values(
-                        "confidence", ascending=False
-                    )
-                    st.caption("Distribución interna del video")
-                    st.bar_chart(score_frame.set_index("prediction"))
+                    if not aggregate["class_summary"].empty:
+                        st.caption("Score operativo por clase")
+                        st.bar_chart(aggregate["class_summary"].set_index("class_name")["decision_score"])
                 except Exception as error:
                     st.error(f"No se pudo evaluar el video: {error}")
             else:
                 image = Image.open(temp_path)
-                st.image(image, use_container_width=True)
+                st.image(image, width="stretch")
                 try:
                     prediction = predict_image_details(temp_path)
                     label = prediction["prediction"]
@@ -395,6 +548,7 @@ def _render_experiment_panel(summary: pd.DataFrame | None, report_text: str | No
                         ).sort_values("Score", ascending=False)
                         st.caption("Distribución interna del modelo")
                         st.bar_chart(score_frame.set_index("Clase"))
+                        st.dataframe(score_frame, width="stretch", hide_index=True)
                 except Exception as error:
                     st.error(f"No se pudo evaluar la imagen: {error}")
         else:
@@ -422,7 +576,7 @@ def _render_experiment_panel(summary: pd.DataFrame | None, report_text: str | No
             latest = summary.sort_values("validation_f1_macro", ascending=False)
             st.dataframe(
                 latest[["model_name", "validation_f1_macro", "validation_accuracy", "best_params"]],
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
 

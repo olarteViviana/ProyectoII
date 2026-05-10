@@ -9,7 +9,7 @@ import mlflow.sklearn
 import numpy as np
 import optuna
 import pandas as pd
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score, hamming_loss, jaccard_score
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score, hamming_loss, jaccard_score, recall_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MultiLabelBinarizer
 from sklearn.exceptions import ConvergenceWarning
@@ -142,9 +142,15 @@ def _optimize_multilabel_thresholds(y_true: np.ndarray, scores: np.ndarray, conf
     return thresholds
 
 
-def _compute_metrics(y_true, predictions) -> dict:
+def _risk_label_indices(label_classes: list[str] | None) -> list[int]:
+    if not label_classes:
+        return []
+    return [index for index, label in enumerate(label_classes) if str(label) != "NormalVideos"]
+
+
+def _compute_metrics(y_true, predictions, label_classes: list[str] | None = None) -> dict:
     if _is_multilabel_target(y_true):
-        return {
+        metrics = {
             "accuracy": accuracy_score(y_true, predictions),
             "f1_macro": f1_score(y_true, predictions, average="macro", zero_division=0),
             "f1_micro": f1_score(y_true, predictions, average="micro", zero_division=0),
@@ -153,6 +159,23 @@ def _compute_metrics(y_true, predictions) -> dict:
             "jaccard_samples": jaccard_score(y_true, predictions, average="samples", zero_division=0),
             "hamming_loss": hamming_loss(y_true, predictions),
         }
+        risk_indices = _risk_label_indices(label_classes)
+        if risk_indices:
+            risk_true = y_true[:, risk_indices]
+            risk_predictions = predictions[:, risk_indices]
+            metrics.update(
+                {
+                    "risk_f1_macro": f1_score(risk_true, risk_predictions, average="macro", zero_division=0),
+                    "risk_recall_macro": recall_score(
+                        risk_true,
+                        risk_predictions,
+                        average="macro",
+                        zero_division=0,
+                    ),
+                    "risk_f1_micro": f1_score(risk_true, risk_predictions, average="micro", zero_division=0),
+                }
+            )
+        return metrics
 
     return {
         "accuracy": accuracy_score(y_true, predictions),
@@ -211,6 +234,7 @@ def _run_optuna_search(
     x_validation,
     y_validation,
     config: dict,
+    label_classes: list[str] | None = None,
 ) -> dict:
     selection_metric = config["model"]["selection_metric"]
     random_state = config["preprocessing"]["random_state"]
@@ -244,7 +268,7 @@ def _run_optuna_search(
                 predictions = _apply_multilabel_thresholds(validation_scores, validation_thresholds)
             else:
                 predictions = model.predict(x_validation)
-            metrics = _compute_metrics(y_validation, predictions)
+            metrics = _compute_metrics(y_validation, predictions, label_classes)
 
             with mlflow.start_run(run_name=f"trial_{trial.number}", nested=True):
                 mlflow.set_tag("model_candidate", model_name)
@@ -297,7 +321,7 @@ def _train_final_model(
     best_params: dict,
     search_run_id: str,
     best_trial_number: int,
-    validation_metrics: dict,
+        validation_metrics: dict,
     x_train,
     y_train,
     x_validation,
@@ -323,6 +347,7 @@ def _train_final_model(
         _log_params(best_params)
 
         final_model.fit(x_full_train, y_full_train)
+        final_model.feature_extractor_ = config["preprocessing"].get("feature_extractor", "resnet50")
         if label_classes is not None:
             final_model.label_classes_ = list(label_classes)
             final_model.multi_output_ = True
@@ -334,7 +359,7 @@ def _train_final_model(
             predictions = _apply_multilabel_thresholds(test_scores, np.asarray(label_thresholds, dtype=float))
         else:
             predictions = final_model.predict(x_test)
-        test_metrics = _compute_metrics(y_test, predictions)
+        test_metrics = _compute_metrics(y_test, predictions, label_classes)
 
         _log_metrics("validation", validation_metrics)
         _log_metrics("test", test_metrics)
@@ -352,11 +377,15 @@ def _train_final_model(
             "validation_f1_micro": validation_metrics.get("f1_micro"),
             "validation_f1_weighted": validation_metrics.get("f1_weighted"),
             "validation_f1_samples": validation_metrics.get("f1_samples"),
+            "validation_risk_f1_macro": validation_metrics.get("risk_f1_macro"),
+            "validation_risk_recall_macro": validation_metrics.get("risk_recall_macro"),
             "accuracy": test_metrics["accuracy"],
             "f1_macro": test_metrics["f1_macro"],
             "f1_micro": test_metrics.get("f1_micro"),
             "f1_weighted": test_metrics["f1_weighted"],
             "f1_samples": test_metrics.get("f1_samples"),
+            "risk_f1_macro": test_metrics.get("risk_f1_macro"),
+            "risk_recall_macro": test_metrics.get("risk_recall_macro"),
             "jaccard_samples": test_metrics.get("jaccard_samples"),
             "hamming_loss": test_metrics.get("hamming_loss"),
         }
@@ -410,10 +439,31 @@ def train(config_path: str | Path | None = None) -> dict:
 
     image_size = config["preprocessing"]["image_size"]
     color_mode = config["preprocessing"]["color_mode"]
+    feature_extractor = config["preprocessing"].get("feature_extractor", "resnet50")
+    embedding_cache_dir = config["preprocessing"].get("embedding_cache_dir")
+    embedding_cache_path = project_path(embedding_cache_dir) if embedding_cache_dir else None
 
-    x_train, y_train = build_feature_matrix(train_manifest, image_size, color_mode)
-    x_validation, y_validation = build_feature_matrix(validation_manifest, image_size, color_mode)
-    x_test, y_test = build_feature_matrix(test_manifest, image_size, color_mode)
+    x_train, y_train = build_feature_matrix(
+        train_manifest,
+        image_size,
+        color_mode,
+        feature_extractor=feature_extractor,
+        cache_dir=embedding_cache_path,
+    )
+    x_validation, y_validation = build_feature_matrix(
+        validation_manifest,
+        image_size,
+        color_mode,
+        feature_extractor=feature_extractor,
+        cache_dir=embedding_cache_path,
+    )
+    x_test, y_test = build_feature_matrix(
+        test_manifest,
+        image_size,
+        color_mode,
+        feature_extractor=feature_extractor,
+        cache_dir=embedding_cache_path,
+    )
 
     label_classes = None
     if _is_multi_output_config(config):
@@ -426,7 +476,15 @@ def train(config_path: str | Path | None = None) -> dict:
 
     candidate_results = []
     for model_name in config["model"]["candidate_models"]:
-        search_result = _run_optuna_search(model_name, x_train, y_train, x_validation, y_validation, config)
+        search_result = _run_optuna_search(
+            model_name,
+            x_train,
+            y_train,
+            x_validation,
+            y_validation,
+            config,
+            label_classes,
+        )
         candidate_results.append(search_result)
 
     selection_metric = config["model"]["selection_metric"]
@@ -507,6 +565,9 @@ def train(config_path: str | Path | None = None) -> dict:
             "validation_f1_micro": result["validation_metrics"].get("f1_micro"),
             "validation_f1_weighted": result["validation_metrics"].get("f1_weighted"),
             "validation_f1_samples": result["validation_metrics"].get("f1_samples"),
+            "validation_risk_f1_macro": result["validation_metrics"].get("risk_f1_macro"),
+            "validation_risk_recall_macro": result["validation_metrics"].get("risk_recall_macro"),
+            "validation_risk_f1_micro": result["validation_metrics"].get("risk_f1_micro"),
             "validation_jaccard_samples": result["validation_metrics"].get("jaccard_samples"),
             "validation_hamming_loss": result["validation_metrics"].get("hamming_loss"),
             "final_run_id": None,
@@ -515,6 +576,8 @@ def train(config_path: str | Path | None = None) -> dict:
             "f1_micro": None,
             "f1_weighted": None,
             "f1_samples": None,
+            "risk_f1_macro": None,
+            "risk_recall_macro": None,
             "jaccard_samples": None,
             "hamming_loss": None,
             "is_best": False,
@@ -528,6 +591,8 @@ def train(config_path: str | Path | None = None) -> dict:
                     "f1_micro": best_result.get("f1_micro"),
                     "f1_weighted": best_result["f1_weighted"],
                     "f1_samples": best_result.get("f1_samples"),
+                    "risk_f1_macro": best_result.get("risk_f1_macro"),
+                    "risk_recall_macro": best_result.get("risk_recall_macro"),
                     "jaccard_samples": best_result.get("jaccard_samples"),
                     "hamming_loss": best_result.get("hamming_loss"),
                     "is_best": True,

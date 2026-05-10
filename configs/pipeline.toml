@@ -6,6 +6,8 @@ manifest_path = "data/processed/manifest.csv"
 [preprocessing]
 image_size = 96
 color_mode = "rgb"
+feature_extractor = "resnet50"
+embedding_cache_dir = "data/processed/embeddings"
 test_size = 0.2
 validation_size = 0.25
 random_state = 42
@@ -15,18 +17,18 @@ output_path = "models/ucf_crime_baseline.joblib"
 multi_output = true
 max_iter = 300
 class_weight = "balanced"
-max_train_samples = 6000
-max_validation_samples = 800
-max_test_samples = 800
-min_train_samples_per_class = 150
-max_train_samples_per_class = 500
+max_train_samples = 10000
+max_validation_samples = 1200
+max_test_samples = 1200
+min_train_samples_per_class = 250
+max_train_samples_per_class = 800
 candidate_models = [
     "logistic_regression",
     "linear_svm",
     "extra_trees",
     "random_forest",
 ]
-selection_metric = "f1_macro"
+selection_metric = "risk_f1_macro"
 
 [model.threshold_search]
 min = 0.05

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from functools import lru_cache
 from pathlib import Path
 
@@ -77,10 +78,35 @@ def _get_resnet50_model():
     return model, device
 
 
-def load_image_vector_pretrained(image_path: str | Path, embedding_dim: int = 2048) -> np.ndarray:
-    """Extract ResNet-50 embeddings from an image (2048-dim feature vector)."""
-    model, device = _get_resnet50_model()
-    
+@lru_cache(maxsize=1)
+def _get_vgg16_model():
+    """Load pretrained VGG16 and keep it as a feature extractor."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    weights = models.VGG16_Weights.IMAGENET1K_V1
+    model = models.vgg16(weights=weights)
+    model.classifier = torch.nn.Sequential(*list(model.classifier.children())[:-1])
+    model.to(device)
+    model.eval()
+    return model, device
+
+
+def _pretrained_embedding_dim(feature_extractor: str) -> int:
+    if feature_extractor == "resnet50":
+        return 2048
+    if feature_extractor == "vgg16":
+        return 4096
+    raise ValueError(f"Unknown pretrained feature extractor: {feature_extractor}")
+
+
+def load_image_vector_pretrained(image_path: str | Path, feature_extractor: str = "resnet50") -> np.ndarray:
+    """Extract pretrained CNN embeddings from an image."""
+    if feature_extractor == "resnet50":
+        model, device = _get_resnet50_model()
+    elif feature_extractor == "vgg16":
+        model, device = _get_vgg16_model()
+    else:
+        raise ValueError(f"Unknown pretrained feature extractor: {feature_extractor}")
+
     preprocess = transforms.Compose([
         transforms.Resize(256),
         transforms.CenterCrop(224),
@@ -94,8 +120,37 @@ def load_image_vector_pretrained(image_path: str | Path, embedding_dim: int = 20
     
     with torch.no_grad():
         embedding = model(tensor).squeeze().cpu().numpy()
-    
+
     return embedding.astype(np.float32)
+
+
+def _embedding_cache_path(image_path: str | Path, feature_extractor: str, cache_dir: str | Path) -> Path:
+    path = Path(image_path)
+    try:
+        stat = path.stat()
+        fingerprint = f"{path.resolve()}|{feature_extractor}|{stat.st_mtime_ns}|{stat.st_size}"
+    except OSError:
+        fingerprint = f"{path}|{feature_extractor}"
+    digest = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
+    return Path(cache_dir) / feature_extractor / f"{digest}.npy"
+
+
+def load_image_vector_pretrained_cached(
+    image_path: str | Path,
+    feature_extractor: str = "resnet50",
+    cache_dir: str | Path | None = None,
+) -> np.ndarray:
+    if cache_dir is None:
+        return load_image_vector_pretrained(image_path, feature_extractor=feature_extractor)
+
+    cache_path = _embedding_cache_path(image_path, feature_extractor, cache_dir)
+    if cache_path.exists():
+        return np.load(cache_path).astype(np.float32)
+
+    embedding = load_image_vector_pretrained(image_path, feature_extractor=feature_extractor)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(cache_path, embedding)
+    return embedding
 
 
 def load_image_vector(image_path: str | Path, image_size: int, color_mode: str) -> np.ndarray:
@@ -136,6 +191,8 @@ def build_feature_matrix(
     image_size: int,
     color_mode: str,
     use_pretrained: bool = True,
+    feature_extractor: str = "resnet50",
+    cache_dir: str | Path | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Build feature matrix from images.
@@ -144,23 +201,30 @@ def build_feature_matrix(
         manifest: DataFrame with 'path' and 'label' columns
         image_size: Size for traditional HOG features (ignored if use_pretrained=True)
         color_mode: 'rgb' or 'grayscale' (ignored if use_pretrained=True)
-        use_pretrained: If True, use ResNet-50 embeddings (2048-dim); else use HOG+color+edge
+        use_pretrained: If True, use CNN embeddings; else use HOG+color+edge
+        feature_extractor: CNN backbone to use for embeddings ('resnet50' or 'vgg16')
+        cache_dir: Optional folder to cache embeddings and speed up repeated runs
     
     Returns:
         Tuple of (features array, labels array)
     """
     if use_pretrained:
-        print("Loading ResNet-50 pretrained model...")
+        embedding_dim = _pretrained_embedding_dim(feature_extractor)
+        print(f"Loading {feature_extractor} pretrained model...")
         features = []
         for idx, row in enumerate(manifest.itertuples(index=False)):
             try:
-                embedding = load_image_vector_pretrained(row.path)
+                embedding = load_image_vector_pretrained_cached(
+                    row.path,
+                    feature_extractor=feature_extractor,
+                    cache_dir=cache_dir,
+                )
                 features.append(embedding)
                 if (idx + 1) % 50 == 0:
                     print(f"  Processed {idx + 1}/{len(manifest)} images")
             except Exception as e:
                 print(f"  Warning: failed to process {row.path}: {e}")
-                features.append(np.zeros(2048, dtype=np.float32))
+                features.append(np.zeros(embedding_dim, dtype=np.float32))
         labels = manifest["label"].to_numpy()
         return np.vstack(features), labels
     else:
