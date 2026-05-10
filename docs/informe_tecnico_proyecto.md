@@ -1222,7 +1222,132 @@ Validar politicas temporales:
 uv run python -m ucf_crime_recognition.tools.validate_temporal_policies data/a/evaluar --output reports/temporal_policy_validation
 ```
 
-## 23. Conclusiones
+## 23. Cambios recientes realizados al proyecto
+
+En la ultima iteracion del proyecto se realizaron varios ajustes importantes con dos objetivos principales: mejorar la coherencia metodologica del pipeline y preparar una explicacion mas solida para la asesoria con el profesor.
+
+### 23.1. Clasificacion multi-etiqueta con `MultiOutputClassifier`
+
+Inicialmente el pipeline estaba mas orientado a clasificacion multiclase, es decir, a escoger una sola clase dominante por imagen o video. Sin embargo, en el contexto de vigilancia un mismo video puede contener mas de un evento relevante. Por ejemplo, una secuencia podria mostrar simultaneamente `Robbery` y `Fighting`, o un evento de `Burglary` con presencia de `Assault`.
+
+Por esa razon se adapto el entrenamiento para trabajar como problema multi-etiqueta cuando `multi_output = true` en `configs/pipeline.toml`. En este modo, las etiquetas se transforman con `MultiLabelBinarizer` y cada clase se representa como una salida binaria independiente. Luego, los clasificadores base se envuelven con `MultiOutputClassifier`, permitiendo que el modelo aprenda una decision separada por cada categoria.
+
+Este cambio es metodologicamente importante porque evita forzar al modelo a elegir una sola clase cuando el fenomeno real puede contener varias. Tambien permite aplicar umbrales independientes por clase, lo cual es util en datasets desbalanceados donde algunas categorias tienen muy pocos ejemplos.
+
+### 23.2. Metricas orientadas a clases de riesgo
+
+Se agregaron metricas especificas para evaluar mejor las clases anormales o de riesgo. Antes, una metrica global podia verse artificialmente favorecida por `NormalVideos`, porque esta clase suele tener muchos mas ejemplos que las demas. Esto es peligroso en un sistema de vigilancia: un modelo que predice casi todo como normal puede obtener ciertos numeros aceptables, pero fallar justamente en las clases importantes.
+
+Por eso se incorporaron metricas como:
+
+- `risk_f1_macro`: calcula F1 macro excluyendo `NormalVideos`.
+- `risk_recall_macro`: mide que tanto se estan recuperando las clases de riesgo.
+- `risk_f1_micro`: resume el desempeno global sobre las etiquetas de riesgo.
+
+La configuracion actual selecciona modelos usando:
+
+```toml
+selection_metric = "risk_f1_macro"
+```
+
+Esta decision hace que Optuna y la seleccion final favorezcan modelos que funcionen mejor en eventos anormales, no solamente en la clase normal.
+
+### 23.3. Aumento del volumen de datos usados en entrenamiento
+
+Tambien se ajustaron los limites de muestreo del dataset para que el pipeline use mas informacion durante el entrenamiento, validacion y prueba. Esto ayuda especialmente porque las clases de crimen tienen menos ejemplos que `NormalVideos`, y el modelo necesita mas variabilidad visual para aprender patrones utiles.
+
+En `configs/pipeline.toml` se aumento la cantidad maxima de muestras y se definieron limites por clase:
+
+```toml
+max_train_samples = 10000
+max_validation_samples = 1200
+max_test_samples = 1200
+min_train_samples_per_class = 250
+max_train_samples_per_class = 800
+```
+
+La intencion no es inflar artificialmente el resultado, sino permitir que el modelo vea mas ejemplos reales y reducir el sesgo hacia las clases dominantes.
+
+### 23.4. Cache de embeddings visuales
+
+Como la extraccion de caracteristicas con CNN preentrenadas puede ser lenta, se agrego un sistema de cache para guardar los embeddings ya calculados. Esto evita recalcular la representacion visual de la misma imagen en ejecuciones posteriores.
+
+La configuracion queda definida asi:
+
+```toml
+embedding_cache_dir = "data/processed/embeddings"
+```
+
+Este cambio no modifica directamente la calidad predictiva del modelo, pero mejora mucho la eficiencia experimental. Permite probar configuraciones, modelos y metricas con menor tiempo de espera, especialmente cuando se trabaja con miles de imagenes.
+
+### 23.5. Extractor visual configurable: ResNet-50 y VGG16
+
+Se modifico la extraccion de caracteristicas para que el extractor visual sea configurable. El proyecto ahora puede usar `resnet50` o `vgg16` desde `configs/pipeline.toml`.
+
+Ejemplo:
+
+```toml
+feature_extractor = "resnet50"
+```
+
+Tambien se probo la alternativa:
+
+```toml
+feature_extractor = "vgg16"
+```
+
+La razon de este cambio fue responder a la observacion del profesor sobre si ResNet-50, entrenado con ImageNet, era la mejor opcion para un dataset de vigilancia. La conclusion tecnica es que VGG16 sirve como comparacion, pero no resuelve por si solo el problema de relaciones humanas, porque sus pesos tambien provienen de ImageNet. Es decir, tanto ResNet-50 como VGG16 aprenden principalmente objetos, texturas y escenas, no interacciones humanas complejas.
+
+En las pruebas recientes, el resultado con VGG16 fue peor que con ResNet-50. Por eso se dejo nuevamente:
+
+```toml
+feature_extractor = "resnet50"
+```
+
+Esto no significa que ResNet-50 sea perfecto, sino que empiricamente funciono mejor dentro del pipeline actual. Para mejorar de forma mas profunda, la siguiente linea de trabajo deberia explorar modelos entrenados en datos con personas, acciones o deteccion de objetos, por ejemplo modelos basados en COCO, pose estimation o video action recognition.
+
+### 23.6. Mejora de la inferencia en videos
+
+La logica de prediccion se ajusto para conservar la informacion multi-etiqueta. En lugar de devolver solamente una clase, el sistema puede reportar:
+
+- clases activas por frame,
+- puntajes por clase,
+- umbrales por clase,
+- clase dominante,
+- evidencia acumulada por video.
+
+Esto es importante porque la interfaz y las politicas temporales necesitan distinguir entre el maximo bruto de probabilidad y la decision operativa final. Un video puede tener una probabilidad alta de `NormalVideos`, pero tambien tener evidencia puntual de una clase de riesgo. Por eso se agrego una logica que combina promedio, pico, persistencia y peso operativo de cada clase.
+
+### 23.7. Mejora de la interfaz grafica
+
+La interfaz de Streamlit se ajusto para reducir confusiones en la interpretacion de resultados. Antes podia aparecer una clase de riesgo en la parte superior y `NormalVideos` como probabilidad maxima en la tabla, lo que parecia contradictorio.
+
+La interfaz ahora separa mejor estos conceptos:
+
+- `Decision operativa`: clase seleccionada segun la politica del sistema.
+- `Evidencia del evento`: score asociado a la decision operativa.
+- `Mayor probabilidad`: clase con mayor probabilidad bruta.
+- `Pico mayor`: valor maximo observado.
+- Tabla agregada por clase con probabilidad media, probabilidad maxima, frames con senal y score operativo.
+- Timeline multi-etiqueta por frame.
+- Grafica de score operativo por clase.
+
+Con esta separacion se puede explicar que el sistema no toma decisiones solo por la probabilidad maxima, sino por una combinacion mas robusta para videos: evidencia temporal, persistencia y severidad de la clase.
+
+### 23.8. Interpretacion de los cambios
+
+Los cambios recientes no deben presentarse como una garantia de alto desempeno, sino como una mejora metodologica del pipeline. El proyecto ahora esta mejor preparado para analizar el problema real, porque:
+
+- reconoce que un video puede tener multiples etiquetas,
+- evalua mejor las clases de riesgo,
+- reduce el sesgo hacia `NormalVideos`,
+- permite comparar extractores visuales,
+- acelera la experimentacion mediante cache,
+- muestra resultados mas interpretables en la interfaz.
+
+El resultado observado despues de probar VGG16 fue util porque evidencio que no basta con cambiar de CNN. La mejora mas prometedora no seria simplemente pasar de ResNet-50 a VGG16, sino incorporar informacion mas relacionada con personas, objetos, acciones y temporalidad.
+
+## 24. Conclusiones
 
 El proyecto esta construido como una solucion MLOps local completa: no solo entrena un modelo, sino que gestiona configuracion, datos, features, experimentos, seleccion de modelo, registro, inferencia y visualizacion.
 
