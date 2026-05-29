@@ -1,39 +1,38 @@
 from __future__ import annotations
 
+from io import BytesIO
 import tempfile
 from pathlib import Path
 
-import cv2
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageDraw, ImageOps
 
 from ucf_crime_recognition.config import load_config, project_path
+from ucf_crime_recognition.features.engineering import _clip_frame_paths, _frame_identity
 from ucf_crime_recognition.predict import predict_image_details
+from ucf_crime_recognition.services import triage as triage_service
 
 
 APP_NAME = "Sentinel Review"
-HIGH_RISK_LABELS = {"Abuse", "Arson", "Assault", "Explosion", "Fighting", "Robbery", "Shooting"}
-MEDIUM_RISK_LABELS = {"Burglary", "RoadAccidents", "Shoplifting", "Stealing", "Vandalism"}
-VIDEO_EXTENSIONS = {"mp4", "mov", "avi", "mkv", "webm"}
-FRAME_SAMPLES = 16
-
-LABEL_ACTIONS = {
-    "Abuse": "Escalar al equipo de seguridad y revisar el clip completo.",
-    "Arson": "Bloquear zona, alertar a emergencias y guardar evidencia.",
-    "Assault": "Enviar alerta inmediata y marcar la cámara para revisión humana.",
-    "Explosion": "Evacuar el área virtualmente y notificar supervisión.",
-    "Fighting": "Priorizar revisión y generar ticket de incidente.",
-    "Robbery": "Restringir acceso, revisar rutas de salida y compartir evidencia.",
-    "Shooting": "Escalar como incidente crítico de forma inmediata.",
-    "Burglary": "Abrir verificación manual y revisar perímetro.",
-    "RoadAccidents": "Notificar al operador y registrar ubicación.",
-    "Shoplifting": "Guardar clips clave y activar seguimiento interno.",
-    "Stealing": "Registrar el evento y alertar al guardia de turno.",
-    "Vandalism": "Marcar para revisión y comparar con cámaras cercanas.",
-    "NormalVideos": "Sin alerta crítica. Mantener seguimiento pasivo.",
+FRAME_SAMPLES = triage_service.FRAME_SAMPLES
+TEMPORAL_COVERAGE_OPTIONS = {
+    "Rápida": 8,
+    "Balanceada": FRAME_SAMPLES,
+    "Alta": 64,
+    "Máxima": 128,
 }
+CLIP_WINDOW_OPTIONS = {
+    "Corta": 1.0,
+    "Media": triage_service.CLIP_WINDOW_SECONDS,
+    "Larga": 4.0,
+    "Amplia": 6.0,
+    "Extendida": 10.0,
+}
+REVIEW_WINDOW_SECONDS = 2.0
+GALLERY_COLUMNS = 4
 
 
 def _load_summary() -> pd.DataFrame | None:
@@ -52,27 +51,77 @@ def _load_report_text() -> str | None:
     return None
 
 
+def _render_score_histogram(
+    scores: pd.Series | list[float],
+    labels: pd.Series | list[str],
+    title: str,
+) -> None:
+    chart_data = pd.DataFrame(
+        {
+            "label": pd.Series(labels, dtype="string"),
+            "score": pd.Series(scores, dtype="float64"),
+        }
+    ).dropna()
+    if chart_data.empty:
+        return
+
+    bin_edges = np.linspace(0.0, 1.0, 6)
+    chart_data["score"] = chart_data["score"].clip(0.0, 1.0)
+    chart_data["bin"] = pd.cut(
+        chart_data["score"],
+        bins=bin_edges,
+        include_lowest=True,
+        right=True,
+    )
+    grouped = chart_data.groupby("bin", observed=False)
+    counts = grouped.size().to_numpy()
+    bin_labels = [f"{left:.1f}-{right:.1f}" for left, right in zip(bin_edges[:-1], bin_edges[1:])]
+    class_labels = []
+    for _, group in grouped:
+        names = group.sort_values("score", ascending=False)["label"].astype(str).tolist()
+        if len(names) > 4:
+            names = [*names[:4], f"+{len(names) - 4} más"]
+        class_labels.append("\n".join(names))
+
+    fig_height = 4.2 + max((label.count("\n") for label in class_labels), default=0) * 0.25
+    fig, ax = plt.subplots(figsize=(9, fig_height))
+    bars = ax.bar(
+        bin_labels,
+        counts,
+        color="#60a5fa",
+        edgecolor="#172033",
+        linewidth=1.1,
+        alpha=0.9,
+    )
+    max_count = max(counts.max(), 1)
+    for bar, count, label_text in zip(bars, counts, class_labels):
+        if count == 0:
+            continue
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            count + max_count * 0.04,
+            label_text,
+            ha="center",
+            va="bottom",
+            fontsize=8.5,
+            color="#111827",
+        )
+
+    ax.set_title(title, fontsize=12, color="#111827", pad=12)
+    ax.set_xlabel("Rango de score")
+    ax.set_ylabel("Cantidad de clases")
+    ax.set_ylim(0, max_count * 1.55)
+    ax.grid(axis="y", color="#d7deea", alpha=0.8)
+    ax.set_facecolor("#f8fafc")
+    fig.patch.set_facecolor("#ffffff")
+    for spine in ax.spines.values():
+        spine.set_color("#d7deea")
+    st.pyplot(fig, use_container_width=True)
+    plt.close(fig)
+
+
 def _risk_profile(label: str, confidence: float) -> tuple[str, str, str]:
-    if label in HIGH_RISK_LABELS:
-        tier = "Crítico"
-        score = "Alto"
-    elif label in MEDIUM_RISK_LABELS:
-        tier = "Vigilancia"
-        score = "Medio"
-    else:
-        tier = "Normal"
-        score = "Bajo"
-
-    if label == "NormalVideos" and confidence < 0.5:
-        tier = "Revisión"
-        score = "Medio"
-
-    if confidence < 0.45 and tier != "Normal":
-        score = "Medio"
-        tier = "Revisión"
-
-    recommendation = LABEL_ACTIONS.get(label, "Sin recomendación específica disponible.")
-    return tier, score, recommendation
+    return triage_service.risk_profile(label, confidence)
 
 
 def _incident_summary(label: str, confidence: float) -> str:
@@ -89,23 +138,11 @@ def _format_percent(value: float) -> str:
 
 
 def _risk_signal_from_scores(class_scores: dict) -> tuple[str, float]:
-    risk_scores = {
-        str(class_name): float(probability)
-        for class_name, probability in class_scores.items()
-        if str(class_name) != "NormalVideos"
-    }
-    if not risk_scores:
-        return "N/D", 0.0
-
-    class_name = max(risk_scores, key=risk_scores.get)
-    return class_name, risk_scores[class_name]
+    return triage_service.risk_signal_from_scores(class_scores)
 
 
 def _format_active_labels(prediction: dict) -> str:
-    labels = prediction.get("predictions")
-    if labels:
-        return " | ".join(str(label) for label in labels)
-    return str(prediction.get("prediction", ""))
+    return triage_service.format_active_labels(prediction)
 
 
 def _save_upload(uploaded_file) -> Path:
@@ -117,162 +154,270 @@ def _save_upload(uploaded_file) -> Path:
 
 
 def _is_video_file(uploaded_file) -> bool:
-    return Path(uploaded_file.name).suffix.lower().lstrip(".") in VIDEO_EXTENSIONS
+    return triage_service.is_video_file(uploaded_file)
 
 
-def _extract_sampled_frames(video_path: Path, frame_samples: int = FRAME_SAMPLES) -> list[dict]:
-    capture = cv2.VideoCapture(str(video_path))
-    if not capture.isOpened():
-        raise ValueError("No se pudo abrir el video.")
-
-    total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps = capture.get(cv2.CAP_PROP_FPS) or 1.0
-    if total_frames <= 0:
-        capture.release()
-        raise ValueError("El video no contiene fotogramas legibles.")
-
-    sample_count = min(frame_samples, total_frames)
-    frame_indexes = sorted({int(round(index)) for index in np.linspace(0, total_frames - 1, sample_count)})
-
-    extracted_frames: list[dict] = []
-    temp_dir = Path(tempfile.mkdtemp(prefix="ucf-crime-frames-"))
-
-    for position, frame_index in enumerate(frame_indexes):
-        capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
-        success, frame = capture.read()
-        if not success:
-            continue
-
-        timestamp_seconds = frame_index / fps
-        image_path = temp_dir / f"frame_{position:03d}_{frame_index:06d}.png"
-        image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        Image.fromarray(image_rgb).save(image_path)
-        extracted_frames.append(
-            {
-                "frame_index": frame_index,
-                "timestamp_seconds": timestamp_seconds,
-                "image_path": image_path,
-            }
-        )
-
-    capture.release()
-    return extracted_frames
+def _extract_sampled_frames(
+    video_path: Path,
+    frame_samples: int = FRAME_SAMPLES,
+    clip_window_seconds: float = triage_service.CLIP_WINDOW_SECONDS,
+    motion_priority: bool = triage_service.MOTION_PRIORITY,
+) -> list[dict]:
+    return triage_service.extract_sampled_frames(
+        video_path,
+        frame_samples=frame_samples,
+        clip_window_seconds=clip_window_seconds,
+        motion_priority=motion_priority,
+    )
 
 
 def _aggregate_video_predictions(frame_results: list[dict]) -> dict:
-    if not frame_results:
-        raise ValueError("No fue posible extraer ningún frame del video.")
+    return triage_service.aggregate_video_predictions(frame_results)
 
-    result_frame = pd.DataFrame(frame_results)
-    score_rows: list[dict] = []
-    for frame in frame_results:
-        for class_name, probability in frame.get("class_scores", {}).items():
-            score_rows.append(
-                {
-                    "class_name": class_name,
-                    "frame_index": frame["frame_index"],
-                    "timestamp_s": frame["timestamp_s"],
-                    "probability": float(probability),
-                }
-            )
 
-    score_frame = pd.DataFrame(score_rows)
-    if score_frame.empty:
-        dominant_label = (
-            result_frame.groupby("prediction")
-            .agg(count=("prediction", "size"), mean_confidence=("confidence", "mean"), max_confidence=("confidence", "max"))
-            .sort_values(["count", "mean_confidence"], ascending=False)
-            .reset_index()
-            .iloc[0]
-        )
-        label = str(dominant_label["prediction"])
-        confidence = float(dominant_label["max_confidence"])
-        class_summary = pd.DataFrame()
-        top_alternative = None
-        probability_leader_label = label
-        probability_leader_value = confidence
-        decision_reason = "prediccion_frame"
-        decision_note = "La decisión se calculó por mayoría de predicciones en los frames muestreados."
-    else:
-        class_summary = (
-            score_frame.groupby("class_name")
-            .agg(
-                mean_probability=("probability", "mean"),
-                max_probability=("probability", "max"),
-                frame_hits=("probability", lambda values: int((values >= 0.2).sum())),
-            )
-            .reset_index()
-        )
-        class_summary["risk_weight"] = class_summary["class_name"].map(
-            lambda class_name: 2.0 if class_name in HIGH_RISK_LABELS else 1.3 if class_name in MEDIUM_RISK_LABELS else 1.0
-        )
-        class_summary["decision_score"] = (
-            class_summary["mean_probability"] * class_summary["risk_weight"]
-            + class_summary["max_probability"] * 0.15
-            + class_summary["frame_hits"] * 0.01
-        )
-        class_summary = class_summary.sort_values(
-            ["decision_score", "max_probability", "mean_probability"], ascending=False
-        ).reset_index(drop=True)
+def _build_clip_contact_sheet(
+    anchor_path: str | Path,
+    clip_len: int = triage_service.VIDEO_CLIP_LEN,
+    columns: int = 4,
+    thumbnail_size: tuple[int, int] = (150, 95),
+) -> Image.Image:
+    anchor_path = Path(anchor_path)
+    clip_paths = _clip_frame_paths(anchor_path, clip_len=clip_len)
+    rows = int(np.ceil(len(clip_paths) / columns))
+    cell_width = thumbnail_size[0] + 14
+    cell_height = thumbnail_size[1] + 28
+    sheet = Image.new("RGB", (columns * cell_width, rows * cell_height), "#f8fafc")
 
-        best_row = class_summary.iloc[0]
-        label = str(best_row["class_name"])
-        confidence = float(best_row["max_probability"])
-        top_alternative = class_summary.iloc[1] if len(class_summary) > 1 else None
-        probability_leader = class_summary.sort_values("max_probability", ascending=False).iloc[0]
-        probability_leader_label = str(probability_leader["class_name"])
-        probability_leader_value = float(probability_leader["max_probability"])
-        decision_reason = "score_operativo"
-        decision_note = "La decisión usa score operativo: promedio, pico, persistencia y peso de riesgo por clase."
+    for index, frame_path in enumerate(clip_paths):
+        with Image.open(frame_path) as frame:
+            thumbnail = ImageOps.fit(frame.convert("RGB"), thumbnail_size, method=Image.Resampling.BILINEAR)
 
-    if not class_summary.empty:
-        normal_row = class_summary[class_summary["class_name"] == "NormalVideos"]
-        risk_rows = class_summary[class_summary["class_name"] != "NormalVideos"]
-        if not normal_row.empty and not risk_rows.empty:
-            normal_score = float(normal_row.iloc[0]["decision_score"])
-            risk_row = risk_rows.sort_values(["decision_score", "max_probability", "mean_probability"], ascending=False).iloc[0]
-            risk_score = float(risk_row["decision_score"])
-            risk_hits = int(risk_row["frame_hits"])
-            risk_peak = float(risk_row["max_probability"])
+        border_color = "#2563eb" if Path(frame_path) == anchor_path else "#d7deea"
+        thumbnail = ImageOps.expand(thumbnail, border=3, fill=border_color)
+        x = (index % columns) * cell_width + 4
+        y = (index // columns) * cell_height + 4
+        sheet.paste(thumbnail, (x, y))
 
-            if risk_peak >= 0.20 and risk_hits >= 2 and risk_score >= normal_score * 0.55:
-                label = str(risk_row["class_name"])
-                confidence = risk_peak
-                decision_reason = "prioridad_riesgo"
-                decision_note = (
-                    f"{label} no necesariamente tiene la mayor probabilidad bruta; se priorizó porque aparece "
-                    f"en {risk_hits} frames con señal de riesgo y su score operativo es cercano al de NormalVideos."
+        identity = _frame_identity(frame_path)
+        label = f"f{identity[1]}" if identity else frame_path.stem
+        ImageDraw.Draw(sheet).text((x + 4, y + thumbnail.height + 4), label, fill="#111827")
+
+    return sheet
+
+
+def _build_clip_animation(
+    anchor_path: str | Path,
+    fps: float | None = None,
+    clip_len: int = triage_service.VIDEO_CLIP_LEN,
+    frame_size: tuple[int, int] = (480, 300),
+) -> bytes:
+    clip_paths = _clip_frame_paths(anchor_path, clip_len=clip_len)
+    frames = []
+    for frame_path in clip_paths:
+        with Image.open(frame_path) as frame:
+            frames.append(
+                ImageOps.pad(
+                    frame.convert("RGB"),
+                    frame_size,
+                    method=Image.Resampling.BILINEAR,
+                    color="#000000",
                 )
-            elif label == "NormalVideos" and top_alternative is not None:
-                alternative_label = str(top_alternative["class_name"])
-                alternative_score = float(top_alternative["decision_score"])
-                if alternative_label != "NormalVideos" and alternative_score >= normal_score * 0.9:
-                    label = alternative_label
-                    confidence = float(top_alternative["max_probability"])
-                    decision_reason = "alternativa_cercana"
-                    decision_note = (
-                        f"{alternative_label} quedó muy cerca de NormalVideos en score operativo; "
-                        "se muestra como evento para revisión humana."
-                    )
+            )
 
-    tier, score, recommendation = _risk_profile(label, confidence)
-    if not class_summary.empty:
-        class_summary = class_summary.copy()
-        class_summary["selected"] = class_summary["class_name"].eq(label)
+    if not frames:
+        return b""
 
-    return {
-        "prediction": label,
-        "confidence": confidence,
-        "decision_reason": decision_reason,
-        "decision_note": decision_note,
-        "probability_leader": probability_leader_label,
-        "probability_leader_confidence": probability_leader_value,
-        "tier": tier,
-        "score": score,
-        "recommendation": recommendation,
-        "summary_frame": result_frame,
-        "class_summary": class_summary,
-    }
+    safe_fps = max(float(fps or 8.0), 1.0)
+    duration_ms = int(round(1000.0 / min(safe_fps, 12.0)))
+    output = BytesIO()
+    frames[0].save(
+        output,
+        format="GIF",
+        save_all=True,
+        append_images=frames[1:],
+        duration=duration_ms,
+        loop=0,
+    )
+    return output.getvalue()
+
+
+def _build_clip_thumbnail(
+    anchor_path: str | Path,
+    frame_size: tuple[int, int] = (240, 150),
+) -> Image.Image:
+    clip_paths = _clip_frame_paths(anchor_path, clip_len=triage_service.VIDEO_CLIP_LEN)
+    if len(clip_paths) >= 4:
+        selected_paths = [
+            clip_paths[0],
+            clip_paths[len(clip_paths) // 3],
+            clip_paths[(len(clip_paths) * 2) // 3],
+            clip_paths[-1],
+        ]
+    else:
+        selected_paths = clip_paths or [Path(anchor_path)]
+
+    tile_width = max(1, frame_size[0] // len(selected_paths))
+    thumbnail = Image.new("RGB", frame_size, "#000000")
+    for index, frame_path in enumerate(selected_paths):
+        with Image.open(frame_path) as frame:
+            tile = ImageOps.fit(
+                frame.convert("RGB"),
+                (tile_width, frame_size[1]),
+                method=Image.Resampling.BILINEAR,
+            )
+        thumbnail.paste(tile, (index * tile_width, 0))
+
+    return thumbnail
+
+
+def _video_format(video_path: Path) -> str:
+    if video_path.suffix.lower() == ".mp4":
+        return "video/mp4"
+    return "video/x-msvideo"
+
+
+def _numeric_value(value) -> float | None:
+    if value is None or pd.isna(value):
+        return None
+    return float(value)
+
+
+def _rank_event_clips(event_table: pd.DataFrame, order: str) -> pd.DataFrame:
+    if order == "Tiempo":
+        return event_table.sort_values("timestamp_s").reset_index(drop=True)
+    if order == "Movimiento" and "motion_score" in event_table:
+        return event_table.sort_values(
+            ["motion_score", "top_risk_probability"],
+            ascending=[False, False],
+        ).reset_index(drop=True)
+    return event_table.sort_values(
+        ["top_risk_probability", "normal_probability"],
+        ascending=[False, True],
+    ).reset_index(drop=True)
+
+
+def _clip_effective_fps(selected_clip: pd.Series) -> float | None:
+    clip_duration = float(selected_clip.get("clip_duration_seconds") or 0.0)
+    if clip_duration <= 0:
+        return None
+    return triage_service.VIDEO_CLIP_LEN / clip_duration
+
+
+def _render_original_video_window(selected_clip: pd.Series) -> None:
+    video_path = selected_clip.get("source_video_path")
+    if not video_path:
+        return
+
+    path = Path(str(video_path))
+    if not path.exists():
+        return
+
+    clip_start_frame = _numeric_value(selected_clip.get("clip_start_frame"))
+    clip_end_frame = _numeric_value(selected_clip.get("clip_end_frame"))
+    video_fps = _numeric_value(selected_clip.get("video_fps"))
+    if clip_start_frame is not None and clip_end_frame is not None:
+        try:
+            segment_path = triage_service.export_video_segment(
+                path,
+                start_frame=int(clip_start_frame),
+                end_frame=int(clip_end_frame),
+            )
+            st.video(
+                segment_path.read_bytes(),
+                format=_video_format(segment_path),
+                width="stretch",
+            )
+            return
+        except Exception:
+            pass
+
+    timestamp_s = float(selected_clip.get("timestamp_s", 0.0))
+    clip_duration = float(selected_clip.get("clip_duration_seconds") or 0.0)
+    context_seconds = max(REVIEW_WINDOW_SECONDS, clip_duration / 2.0)
+    if video_fps and clip_start_frame is not None and clip_end_frame is not None:
+        start_time = max(0.0, clip_start_frame / video_fps)
+        end_time = max(start_time + 0.1, (clip_end_frame + 1) / video_fps)
+    else:
+        start_time = max(0.0, timestamp_s - context_seconds)
+        end_time = timestamp_s + context_seconds
+    st.video(path.read_bytes(), start_time=start_time, end_time=end_time, width="stretch")
+
+
+def _render_clip_gallery(ranked_clips: pd.DataFrame, gallery_count: int) -> None:
+    if gallery_count < 1:
+        return
+
+    preview_clips = ranked_clips.head(gallery_count)
+    for start in range(0, len(preview_clips), GALLERY_COLUMNS):
+        cols = st.columns(GALLERY_COLUMNS)
+        for column, (_, clip) in zip(cols, preview_clips.iloc[start : start + GALLERY_COLUMNS].iterrows()):
+            with column:
+                st.image(_build_clip_thumbnail(clip["image_path"]), width="stretch")
+                st.caption(
+                    f"{clip['timestamp_s']:.2f}s | "
+                    f"{clip['top_risk_class']} {_format_percent(clip['top_risk_probability'])} | "
+                    f"mov {_format_percent(clip.get('motion_score', 0.0))}"
+                )
+
+
+def _render_clip_inspector(event_table: pd.DataFrame) -> None:
+    if event_table.empty or "image_path" not in event_table:
+        return
+
+    with st.expander("Ver clips evaluados"):
+        order = st.segmented_control(
+            "Orden",
+            options=["Mayor riesgo", "Movimiento", "Tiempo"],
+            default="Mayor riesgo",
+            required=True,
+        )
+        ranked_clips = _rank_event_clips(event_table, str(order))
+        gallery_count = st.slider(
+            "Clips en galería",
+            min_value=1,
+            max_value=len(ranked_clips),
+            value=len(ranked_clips),
+        )
+        _render_clip_gallery(ranked_clips, gallery_count)
+
+        clip_index = st.selectbox(
+            "Reproducir clip",
+            options=list(ranked_clips.index),
+            format_func=lambda index: (
+                f"{ranked_clips.loc[index, 'timestamp_s']:.2f}s | "
+                f"{ranked_clips.loc[index, 'active_labels']} | "
+                f"{ranked_clips.loc[index, 'top_risk_class']} "
+                f"{_format_percent(ranked_clips.loc[index, 'top_risk_probability'])} | "
+                f"mov {_format_percent(ranked_clips.loc[index].get('motion_score', 0.0))}"
+            ),
+        )
+        if clip_index is None:
+            return
+
+        selected_clip = ranked_clips.loc[int(clip_index)]
+        st.caption("Segmento reproducible del video original")
+        _render_original_video_window(selected_clip)
+
+        st.caption("Clip técnico de 16 frames usado por el modelo")
+        clip_duration = float(selected_clip.get("clip_duration_seconds") or 0.0)
+        animation = _build_clip_animation(
+            selected_clip["image_path"],
+            fps=_clip_effective_fps(selected_clip),
+        )
+        if animation:
+            st.image(animation, width="stretch")
+
+        with st.expander("Ver frames del clip"):
+            sheet = _build_clip_contact_sheet(selected_clip["image_path"])
+            st.image(sheet, width="stretch")
+
+        cols = st.columns(6)
+        cols[0].metric("Predicción clip", selected_clip["prediction"])
+        cols[1].metric("Normal ajustado", _format_percent(selected_clip["normal_probability"]))
+        cols[2].metric(str(selected_clip["top_risk_class"]), _format_percent(selected_clip["top_risk_probability"]))
+        cols[3].metric("Duración clip", f"{clip_duration:.2f}s")
+        cols[4].metric("Movimiento", _format_percent(selected_clip.get("motion_score", 0.0)))
+        cols[5].metric("Normal bruto", _format_percent(selected_clip.get("raw_normal_probability", selected_clip["normal_probability"])))
 
 
 def _apply_styles() -> None:
@@ -381,40 +526,93 @@ def _render_experiment_panel(summary: pd.DataFrame | None, report_text: str | No
         if uploaded is not None:
             temp_path = _save_upload(uploaded)
             if _is_video_file(uploaded):
+                coverage_label = st.segmented_control(
+                    "Cobertura temporal",
+                    options=list(TEMPORAL_COVERAGE_OPTIONS),
+                    default="Balanceada",
+                    required=True,
+                )
+                frame_samples = TEMPORAL_COVERAGE_OPTIONS.get(str(coverage_label or "Balanceada"), FRAME_SAMPLES)
+                window_label = st.segmented_control(
+                    "Duración del clip",
+                    options=list(CLIP_WINDOW_OPTIONS),
+                    default="Media",
+                    required=True,
+                )
+                clip_window_seconds = CLIP_WINDOW_OPTIONS.get(
+                    str(window_label or "Media"),
+                    triage_service.CLIP_WINDOW_SECONDS,
+                )
+                motion_priority = st.checkbox("Priorizar movimiento", value=triage_service.MOTION_PRIORITY)
                 st.video(temp_path.read_bytes())
                 try:
-                    frames = _extract_sampled_frames(temp_path)
+                    with st.spinner("Detectando movimiento y extrayendo clips..."):
+                        frames = triage_service.extract_sampled_frames(
+                            temp_path,
+                            frame_samples=frame_samples,
+                            clip_window_seconds=clip_window_seconds,
+                            motion_priority=motion_priority,
+                        )
+                        frames = triage_service.normalize_motion_scores(frames)
                     frame_results: list[dict] = []
 
-                    for frame in frames:
+                    prediction_progress = st.progress(0)
+                    for position, frame in enumerate(frames, start=1):
                         prediction = predict_image_details(frame["image_path"])
-                        label = prediction["prediction"]
-                        confidence = float(prediction["confidence"])
-                        class_scores = prediction.get("class_scores", {})
+                        raw_label = prediction["prediction"]
+                        raw_confidence = float(prediction["confidence"])
+                        raw_class_scores = prediction.get("class_scores", {})
+                        motion_intensity = float(frame.get("motion_intensity") or 0.0)
+                        class_scores = triage_service.adjust_class_scores_for_motion(
+                            raw_class_scores,
+                            motion_intensity,
+                        )
+                        label, confidence = triage_service.motion_adjusted_prediction_label(
+                            raw_label,
+                            class_scores,
+                            motion_intensity,
+                        )
+                        if confidence == 0.0:
+                            confidence = raw_confidence
                         risk_class, risk_probability = _risk_signal_from_scores(class_scores)
                         tier, score, recommendation = _risk_profile(label, confidence)
                         frame_results.append(
                             {
                                 "timestamp_s": round(frame["timestamp_seconds"], 2),
                                 "frame_index": frame["frame_index"],
+                                "clip_start_frame": frame.get("clip_start_frame"),
+                                "clip_end_frame": frame.get("clip_end_frame"),
+                                "clip_duration_seconds": frame.get("clip_duration_seconds"),
+                                "clip_window_seconds": frame.get("clip_window_seconds"),
+                                "video_fps": frame.get("video_fps"),
+                                "motion_score": frame.get("motion_score", 0.0),
+                                "motion_intensity": motion_intensity,
+                                "sampling_reason": frame.get("sampling_reason", "cobertura"),
+                                "image_path": str(frame["image_path"]),
+                                "source_video_path": str(temp_path),
                                 "prediction": label,
-                                "active_labels": _format_active_labels(prediction),
+                                "raw_prediction": raw_label,
+                                "active_labels": label,
                                 "confidence": confidence,
-                                "normal_probability": float(class_scores.get("NormalVideos", 0.0)),
+                                "normal_probability": float(class_scores.get(triage_service.NORMAL_LABEL, 0.0)),
+                                "raw_normal_probability": float(raw_class_scores.get(triage_service.NORMAL_LABEL, 0.0)),
                                 "top_risk_class": risk_class,
                                 "top_risk_probability": risk_probability,
                                 "class_scores": class_scores,
+                                "raw_class_scores": raw_class_scores,
                                 "tier": tier,
                                 "score": score,
                                 "recommendation": recommendation,
                             }
                         )
+                        prediction_progress.progress(position / max(len(frames), 1))
+                    prediction_progress.empty()
 
                     aggregate = _aggregate_video_predictions(frame_results)
                     m1, m2, m3, m4 = st.columns(4)
                     m1.metric("Decisión operativa", aggregate["prediction"])
                     m2.metric("Evidencia del evento", _format_percent(aggregate["confidence"]))
-                    m3.metric("Mayor probabilidad", aggregate["probability_leader"])
+                    m3.metric("Clips evaluados", len(frame_results))
                     m4.metric("Pico mayor", _format_percent(aggregate["probability_leader_confidence"]))
 
                     st.markdown(_incident_summary(aggregate["prediction"], aggregate["confidence"]))
@@ -430,7 +628,7 @@ def _render_experiment_panel(summary: pd.DataFrame | None, report_text: str | No
                     st.success(f"Recomendación operativa: {aggregate['recommendation']}")
 
                     if not aggregate["class_summary"].empty:
-                        st.caption("Evidencia agregada por clase")
+                        st.caption("Evidencia agregada por clase con ajuste operativo")
                         display_summary = aggregate["class_summary"][
                             [
                                 "selected",
@@ -446,7 +644,7 @@ def _render_experiment_panel(summary: pd.DataFrame | None, report_text: str | No
                                 "class_name": "clase",
                                 "mean_probability": "prob. media",
                                 "max_probability": "prob. máxima",
-                                "frame_hits": "frames con señal",
+                                "frame_hits": "clips con señal",
                                 "decision_score": "score operativo",
                             }
                         )
@@ -464,12 +662,20 @@ def _render_experiment_panel(summary: pd.DataFrame | None, report_text: str | No
                         )
 
                     event_table = pd.DataFrame(frame_results)
-                    st.caption("Timeline multi-etiqueta por frame")
+                    st.caption("Timeline multi-etiqueta por clip")
                     st.dataframe(
                         event_table[
                             [
                                 "timestamp_s",
+                                "clip_start_frame",
+                                "clip_end_frame",
+                                "clip_duration_seconds",
+                                "motion_score",
+                                "motion_intensity",
+                                "sampling_reason",
+                                "raw_prediction",
                                 "active_labels",
+                                "raw_normal_probability",
                                 "normal_probability",
                                 "top_risk_class",
                                 "top_risk_probability",
@@ -480,8 +686,16 @@ def _render_experiment_panel(summary: pd.DataFrame | None, report_text: str | No
                         .rename(
                             columns={
                                 "timestamp_s": "tiempo (s)",
+                                "clip_start_frame": "inicio clip",
+                                "clip_end_frame": "fin clip",
+                                "clip_duration_seconds": "duración clip (s)",
+                                "motion_score": "movimiento",
+                                "motion_intensity": "mov. relativa",
+                                "sampling_reason": "muestreo",
+                                "raw_prediction": "pred. bruta",
                                 "active_labels": "etiquetas activas",
-                                "normal_probability": "score NormalVideos",
+                                "raw_normal_probability": "Normal bruto",
+                                "normal_probability": "Normal ajustado",
                                 "top_risk_class": "mayor riesgo",
                                 "top_risk_probability": "score mayor riesgo",
                                 "tier": "nivel",
@@ -519,9 +733,15 @@ def _render_experiment_panel(summary: pd.DataFrame | None, report_text: str | No
                         hide_index=True,
                     )
 
+                    _render_clip_inspector(event_table)
+
                     if not aggregate["class_summary"].empty:
-                        st.caption("Score operativo por clase")
-                        st.bar_chart(aggregate["class_summary"].set_index("class_name")["decision_score"])
+                        st.caption("Histograma de score operativo")
+                        _render_score_histogram(
+                            aggregate["class_summary"]["decision_score"],
+                            aggregate["class_summary"]["class_name"],
+                            "Distribución de evidencia operativa por clase",
+                        )
                 except Exception as error:
                     st.error(f"No se pudo evaluar el video: {error}")
             else:
@@ -546,8 +766,12 @@ def _render_experiment_panel(summary: pd.DataFrame | None, report_text: str | No
                         score_frame = pd.DataFrame(
                             [{"Clase": class_name, "Score": probability} for class_name, probability in scores.items()]
                         ).sort_values("Score", ascending=False)
-                        st.caption("Distribución interna del modelo")
-                        st.bar_chart(score_frame.set_index("Clase"))
+                        st.caption("Histograma de scores del modelo")
+                        _render_score_histogram(
+                            score_frame["Score"],
+                            score_frame["Clase"],
+                            "Distribución de confianza interna por clase",
+                        )
                         st.dataframe(score_frame, width="stretch", hide_index=True)
                 except Exception as error:
                     st.error(f"No se pudo evaluar la imagen: {error}")

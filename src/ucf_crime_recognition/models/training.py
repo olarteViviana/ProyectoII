@@ -348,6 +348,11 @@ def _train_final_model(
 
         final_model.fit(x_full_train, y_full_train)
         final_model.feature_extractor_ = config["preprocessing"].get("feature_extractor", "resnet50")
+        if final_model.feature_extractor_ == "videomae":
+            final_model.video_model_name_ = config["preprocessing"].get(
+                "video_model_name",
+                "MCG-NJU/videomae-base-finetuned-kinetics",
+            )
         if label_classes is not None:
             final_model.label_classes_ = list(label_classes)
             final_model.multi_output_ = True
@@ -440,6 +445,7 @@ def train(config_path: str | Path | None = None) -> dict:
     image_size = config["preprocessing"]["image_size"]
     color_mode = config["preprocessing"]["color_mode"]
     feature_extractor = config["preprocessing"].get("feature_extractor", "resnet50")
+    video_model_name = config["preprocessing"].get("video_model_name", "MCG-NJU/videomae-base-finetuned-kinetics")
     embedding_cache_dir = config["preprocessing"].get("embedding_cache_dir")
     embedding_cache_path = project_path(embedding_cache_dir) if embedding_cache_dir else None
 
@@ -449,6 +455,7 @@ def train(config_path: str | Path | None = None) -> dict:
         color_mode,
         feature_extractor=feature_extractor,
         cache_dir=embedding_cache_path,
+        video_model_name=video_model_name,
     )
     x_validation, y_validation = build_feature_matrix(
         validation_manifest,
@@ -456,6 +463,7 @@ def train(config_path: str | Path | None = None) -> dict:
         color_mode,
         feature_extractor=feature_extractor,
         cache_dir=embedding_cache_path,
+        video_model_name=video_model_name,
     )
     x_test, y_test = build_feature_matrix(
         test_manifest,
@@ -463,6 +471,7 @@ def train(config_path: str | Path | None = None) -> dict:
         color_mode,
         feature_extractor=feature_extractor,
         cache_dir=embedding_cache_path,
+        video_model_name=video_model_name,
     )
 
     label_classes = None

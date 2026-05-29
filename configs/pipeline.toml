@@ -6,7 +6,8 @@ manifest_path = "data/processed/manifest.csv"
 [preprocessing]
 image_size = 96
 color_mode = "rgb"
-feature_extractor = "resnet50"
+feature_extractor = "videomae"
+video_model_name = "MCG-NJU/videomae-base-finetuned-kinetics"
 embedding_cache_dir = "data/processed/embeddings"
 test_size = 0.2
 validation_size = 0.25

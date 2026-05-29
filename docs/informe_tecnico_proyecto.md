@@ -157,7 +157,7 @@ Indica el dataset de Kaggle, la ruta local para datos crudos y la ruta donde se 
 [preprocessing]
 image_size = 96
 color_mode = "rgb"
-feature_extractor = "vgg16"
+feature_extractor = "r2plus1d_18"
 embedding_cache_dir = "data/processed/embeddings"
 test_size = 0.2
 validation_size = 0.25
@@ -166,7 +166,7 @@ random_state = 42
 
 - `image_size`: tamano usado si se extraen caracteristicas tradicionales.
 - `color_mode`: modo de color para la extraccion tradicional.
-- `feature_extractor`: extractor CNN preentrenado usado para embeddings. Puede ser `resnet50` o `vgg16`.
+- `feature_extractor`: extractor preentrenado usado para embeddings. Puede ser `resnet50`, `vgg16`, `r3d_18` o `r2plus1d_18`.
 - `embedding_cache_dir`: carpeta donde se guardan embeddings para evitar recalcularlos en cada entrenamiento.
 - `test_size`: proporcion usada si el dataset no trae split definido.
 - `validation_size`: proporcion del entrenamiento reservada para validacion interna.
@@ -384,20 +384,23 @@ Por defecto `build_feature_matrix(..., use_pretrained=True)` usa un extractor CN
 
 ```toml
 [preprocessing]
-feature_extractor = "vgg16"
+feature_extractor = "r2plus1d_18"
 ```
 
 Actualmente el codigo permite comparar:
 
 - `resnet50`: ResNet-50 preentrenada en ImageNet, salida de 2048 dimensiones.
 - `vgg16`: VGG16 preentrenada en ImageNet, salida de 4096 dimensiones.
+- `r3d_18`: red 3D preentrenada en Kinetics-400, salida de 512 dimensiones.
+- `r2plus1d_18`: red R(2+1)D preentrenada en Kinetics-400, salida de 512 dimensiones.
 
 Flujo:
 
 1. carga el extractor seleccionado con `torchvision.models`;
 2. elimina la capa final de clasificacion;
 3. deja la red como extractor de embeddings;
-4. convierte cada imagen a RGB;
+4. convierte cada imagen a RGB si el extractor es 2D;
+5. si el extractor es de video, agrupa frames vecinos del mismo video para formar un clip de 16 frames;
 5. redimensiona a 256;
 6. recorta centro a 224x224;
 7. normaliza con medias y desviaciones de ImageNet;
@@ -1280,31 +1283,32 @@ embedding_cache_dir = "data/processed/embeddings"
 
 Este cambio no modifica directamente la calidad predictiva del modelo, pero mejora mucho la eficiencia experimental. Permite probar configuraciones, modelos y metricas con menor tiempo de espera, especialmente cuando se trabaja con miles de imagenes.
 
-### 23.5. Extractor visual configurable: ResNet-50 y VGG16
+### 23.5. Extractor visual configurable: ResNet-50, VGG16 y modelos de accion
 
-Se modifico la extraccion de caracteristicas para que el extractor visual sea configurable. El proyecto ahora puede usar `resnet50` o `vgg16` desde `configs/pipeline.toml`.
+Se modifico la extraccion de caracteristicas para que el extractor visual sea configurable. El proyecto ahora puede usar extractores 2D de imagen y extractores 3D de video desde `configs/pipeline.toml`.
 
 Ejemplo:
 
 ```toml
-feature_extractor = "resnet50"
+feature_extractor = "r2plus1d_18"
 ```
 
-Tambien se probo la alternativa:
+Alternativas disponibles:
 
-```toml
-feature_extractor = "vgg16"
-```
+- `resnet50`: extractor 2D preentrenado en ImageNet.
+- `vgg16`: extractor 2D preentrenado en ImageNet.
+- `r3d_18`: extractor temporal preentrenado en Kinetics-400.
+- `r2plus1d_18`: extractor temporal preentrenado en Kinetics-400.
 
 La razon de este cambio fue responder a la observacion del profesor sobre si ResNet-50, entrenado con ImageNet, era la mejor opcion para un dataset de vigilancia. La conclusion tecnica es que VGG16 sirve como comparacion, pero no resuelve por si solo el problema de relaciones humanas, porque sus pesos tambien provienen de ImageNet. Es decir, tanto ResNet-50 como VGG16 aprenden principalmente objetos, texturas y escenas, no interacciones humanas complejas.
 
-En las pruebas recientes, el resultado con VGG16 fue peor que con ResNet-50. Por eso se dejo nuevamente:
+Por esa razon se agrego soporte para `r3d_18` y `r2plus1d_18`, modelos de reconocimiento de accion preentrenados en Kinetics-400. A diferencia de ResNet-50, estos modelos reciben clips de varios frames y aprenden patrones espaciotemporales. En el manifest actual, cada fila sigue siendo un frame, pero el extractor busca frames vecinos del mismo video para construir un clip de 16 frames centrado en la imagen de referencia.
 
 ```toml
-feature_extractor = "resnet50"
+feature_extractor = "r2plus1d_18"
 ```
 
-Esto no significa que ResNet-50 sea perfecto, sino que empiricamente funciono mejor dentro del pipeline actual. Para mejorar de forma mas profunda, la siguiente linea de trabajo deberia explorar modelos entrenados en datos con personas, acciones o deteccion de objetos, por ejemplo modelos basados en COCO, pose estimation o video action recognition.
+Esto acerca el pipeline al problema real, porque crimen y anomalia en vigilancia no dependen solo de objetos presentes en una imagen, sino de movimiento, interaccion y contexto temporal.
 
 ### 23.6. Mejora de la inferencia en videos
 

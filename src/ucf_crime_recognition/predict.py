@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import argparse
+from functools import lru_cache
 from pathlib import Path
 
 import joblib
 import numpy as np
 
 from ucf_crime_recognition.config import load_config, project_path
-from ucf_crime_recognition.features import load_image_vector, load_image_vector_pretrained
+from ucf_crime_recognition.features import (
+    load_image_vector,
+    load_image_vector_pretrained,
+    load_video_vector_pretrained,
+    load_video_vector_videomae,
+)
 
 
 def _softmax(values: np.ndarray) -> np.ndarray:
@@ -136,23 +142,67 @@ def _prediction_details(model, features: np.ndarray) -> dict:
     }
 
 
+def _config_cache_key(config_path: str | Path | None) -> str:
+    if config_path is None:
+        return ""
+    return str(Path(config_path).expanduser().resolve())
+
+
+@lru_cache(maxsize=16)
+def _load_prediction_config(config_key: str) -> dict:
+    if config_key:
+        return load_config(Path(config_key))
+    return load_config()
+
+
+def _model_fingerprint(model_path: Path) -> tuple[int, int]:
+    try:
+        stat = model_path.stat()
+    except OSError:
+        return 0, 0
+    return stat.st_mtime_ns, stat.st_size
+
+
+@lru_cache(maxsize=4)
+def _load_prediction_model(model_path: str, mtime_ns: int, size: int):
+    return joblib.load(Path(model_path))
+
+
 def predict_image_details(image_path: str | Path, config_path: str | Path | None = None) -> dict:
-    config = load_config(config_path) if config_path else load_config()
+    config = _load_prediction_config(_config_cache_key(config_path))
     model_path = project_path(config["model"]["output_path"])
     image_size = config["preprocessing"]["image_size"]
     color_mode = config["preprocessing"]["color_mode"]
 
-    model = joblib.load(model_path)
+    model_mtime_ns, model_size = _model_fingerprint(model_path)
+    model = _load_prediction_model(str(model_path), model_mtime_ns, model_size)
     
     feature_extractor = getattr(model, "feature_extractor_", config["preprocessing"].get("feature_extractor", None))
     expected_features = getattr(model, "n_features_in_", None)
 
     if feature_extractor in {"resnet50", "vgg16"}:
         features = load_image_vector_pretrained(image_path, feature_extractor=feature_extractor).reshape(1, -1)
+    elif feature_extractor == "videomae":
+        video_model_name = getattr(
+            model,
+            "video_model_name_",
+            config["preprocessing"].get("video_model_name", "MCG-NJU/videomae-base-finetuned-kinetics"),
+        )
+        features = load_video_vector_videomae(image_path, model_name=video_model_name).reshape(1, -1)
+    elif feature_extractor in {"r3d_18", "r2plus1d_18"}:
+        features = load_video_vector_pretrained(image_path, feature_extractor=feature_extractor).reshape(1, -1)
     elif expected_features == 2048:
         features = load_image_vector_pretrained(image_path, feature_extractor="resnet50").reshape(1, -1)
     elif expected_features == 4096:
         features = load_image_vector_pretrained(image_path, feature_extractor="vgg16").reshape(1, -1)
+    elif expected_features == 512:
+        fallback_extractor = config["preprocessing"].get("feature_extractor", "r2plus1d_18")
+        if fallback_extractor not in {"r3d_18", "r2plus1d_18"}:
+            fallback_extractor = "r2plus1d_18"
+        features = load_video_vector_pretrained(image_path, feature_extractor=fallback_extractor).reshape(1, -1)
+    elif expected_features == 768 and config["preprocessing"].get("feature_extractor") == "videomae":
+        video_model_name = config["preprocessing"].get("video_model_name", "MCG-NJU/videomae-base-finetuned-kinetics")
+        features = load_video_vector_videomae(image_path, model_name=video_model_name).reshape(1, -1)
     else:
         features = load_image_vector(image_path, image_size, color_mode).reshape(1, -1)
 

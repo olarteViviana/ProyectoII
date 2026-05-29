@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from functools import lru_cache
 from pathlib import Path
 
@@ -10,7 +11,12 @@ import pandas as pd
 from PIL import Image
 import torch
 import torchvision.models as models
+import torchvision.models.video as video_models
 import torchvision.transforms as transforms
+
+
+DEFAULT_VIDEOMAE_MODEL_NAME = "MCG-NJU/videomae-base-finetuned-kinetics"
+VIDEOMAE_EMBEDDING_DIM = 768
 
 
 @lru_cache(maxsize=32)
@@ -90,12 +96,60 @@ def _get_vgg16_model():
     return model, device
 
 
+@lru_cache(maxsize=1)
+def _get_r3d_18_model():
+    """Load pretrained R3D-18 on Kinetics-400 and remove the classification head."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = video_models.r3d_18(weights=video_models.R3D_18_Weights.KINETICS400_V1)
+    model.fc = torch.nn.Identity()
+    model.to(device)
+    model.eval()
+    return model, device
+
+
+@lru_cache(maxsize=1)
+def _get_r2plus1d_18_model():
+    """Load pretrained R(2+1)D-18 on Kinetics-400 and remove the classification head."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = video_models.r2plus1d_18(weights=video_models.R2Plus1D_18_Weights.KINETICS400_V1)
+    model.fc = torch.nn.Identity()
+    model.to(device)
+    model.eval()
+    return model, device
+
+
+@lru_cache(maxsize=2)
+def _get_videomae_model(model_name: str = DEFAULT_VIDEOMAE_MODEL_NAME):
+    try:
+        from transformers import AutoImageProcessor, VideoMAEModel
+    except ImportError as error:
+        raise ImportError(
+            "The 'transformers' package is required for feature_extractor='videomae'. "
+            "Install project dependencies again before rebuilding the pipeline."
+        ) from error
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    processor = AutoImageProcessor.from_pretrained(model_name)
+    model = VideoMAEModel.from_pretrained(model_name)
+    model.to(device)
+    model.eval()
+    return processor, model, device
+
+
 def _pretrained_embedding_dim(feature_extractor: str) -> int:
     if feature_extractor == "resnet50":
         return 2048
     if feature_extractor == "vgg16":
         return 4096
+    if feature_extractor in {"r3d_18", "r2plus1d_18"}:
+        return 512
+    if feature_extractor == "videomae":
+        return VIDEOMAE_EMBEDDING_DIM
     raise ValueError(f"Unknown pretrained feature extractor: {feature_extractor}")
+
+
+def _is_video_feature_extractor(feature_extractor: str) -> bool:
+    return feature_extractor in {"r3d_18", "r2plus1d_18", "videomae"}
 
 
 def load_image_vector_pretrained(image_path: str | Path, feature_extractor: str = "resnet50") -> np.ndarray:
@@ -124,30 +178,149 @@ def load_image_vector_pretrained(image_path: str | Path, feature_extractor: str 
     return embedding.astype(np.float32)
 
 
-def _embedding_cache_path(image_path: str | Path, feature_extractor: str, cache_dir: str | Path) -> Path:
+def _frame_identity(image_path: str | Path) -> tuple[str, int] | None:
+    path = Path(image_path)
+    match = re.match(r"(?P<video>.+)_(?P<frame>\d+)$", path.stem)
+    if match is None:
+        return None
+    return match.group("video"), int(match.group("frame"))
+
+
+def _clip_frame_paths(anchor_path: str | Path, clip_len: int = 16) -> list[Path]:
+    path = Path(anchor_path)
+    identity = _frame_identity(path)
+    if identity is None:
+        return [path] * clip_len
+
+    video_id, anchor_frame = identity
+    candidates = []
+    for frame_path in path.parent.glob(f"{video_id}_*.png"):
+        frame_identity = _frame_identity(frame_path)
+        if frame_identity is None:
+            continue
+        _, frame_number = frame_identity
+        candidates.append((abs(frame_number - anchor_frame), frame_number, frame_path))
+
+    if not candidates:
+        return [path] * clip_len
+
+    selected = [frame_path for _, _, frame_path in sorted(candidates)[:clip_len]]
+    selected = sorted(selected, key=lambda frame_path: _frame_identity(frame_path)[1] if _frame_identity(frame_path) else 0)
+    if len(selected) < clip_len:
+        selected.extend([selected[-1]] * (clip_len - len(selected)))
+    return selected[:clip_len]
+
+
+def _load_video_clip_tensor(anchor_path: str | Path, clip_len: int = 16) -> torch.Tensor:
+    frame_paths = _clip_frame_paths(anchor_path, clip_len=clip_len)
+    preprocess = transforms.Compose([
+        transforms.Resize((128, 171)),
+        transforms.CenterCrop((112, 112)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.43216, 0.394666, 0.37645], std=[0.22803, 0.22145, 0.216989]),
+    ])
+
+    frames = []
+    for frame_path in frame_paths:
+        with Image.open(frame_path) as image:
+            frames.append(preprocess(image.convert("RGB")))
+
+    return torch.stack(frames, dim=1).unsqueeze(0)
+
+
+def _load_video_clip_frames(anchor_path: str | Path, clip_len: int = 16) -> list[Image.Image]:
+    frames = []
+    for frame_path in _clip_frame_paths(anchor_path, clip_len=clip_len):
+        with Image.open(frame_path) as image:
+            frames.append(image.convert("RGB").copy())
+    return frames
+
+
+def load_video_vector_pretrained(anchor_path: str | Path, feature_extractor: str = "r2plus1d_18") -> np.ndarray:
+    """Extract Kinetics-400 video embeddings from a frame-centered clip."""
+    if feature_extractor == "r3d_18":
+        model, device = _get_r3d_18_model()
+    elif feature_extractor == "r2plus1d_18":
+        model, device = _get_r2plus1d_18_model()
+    else:
+        raise ValueError(f"Unknown video feature extractor: {feature_extractor}")
+
+    tensor = _load_video_clip_tensor(anchor_path).to(device)
+    with torch.no_grad():
+        embedding = model(tensor).squeeze().cpu().numpy()
+
+    return embedding.astype(np.float32)
+
+
+def load_video_vector_videomae(
+    anchor_path: str | Path,
+    model_name: str = DEFAULT_VIDEOMAE_MODEL_NAME,
+    clip_len: int = 16,
+) -> np.ndarray:
+    """Extract a VideoMAE transformer embedding from a frame-centered clip."""
+    processor, model, device = _get_videomae_model(model_name)
+    frames = _load_video_clip_frames(anchor_path, clip_len=clip_len)
+    inputs = processor(frames, return_tensors="pt")
+    pixel_values = inputs["pixel_values"].to(device)
+
+    with torch.no_grad():
+        outputs = model(pixel_values=pixel_values)
+        embedding = outputs.last_hidden_state.mean(dim=1).squeeze(0).cpu().numpy()
+
+    return embedding.astype(np.float32)
+
+
+def _feature_cache_namespace(feature_extractor: str, video_model_name: str | None = None) -> str:
+    if feature_extractor != "videomae" or not video_model_name:
+        return feature_extractor
+    digest = hashlib.sha256(video_model_name.encode("utf-8")).hexdigest()[:12]
+    return f"{feature_extractor}-{digest}"
+
+
+def _embedding_cache_path(
+    image_path: str | Path,
+    feature_extractor: str,
+    cache_dir: str | Path,
+    video_model_name: str | None = None,
+) -> Path:
     path = Path(image_path)
     try:
         stat = path.stat()
-        fingerprint = f"{path.resolve()}|{feature_extractor}|{stat.st_mtime_ns}|{stat.st_size}"
+        fingerprint = f"{path.resolve()}|{feature_extractor}|{video_model_name or ''}|{stat.st_mtime_ns}|{stat.st_size}"
     except OSError:
-        fingerprint = f"{path}|{feature_extractor}"
+        fingerprint = f"{path}|{feature_extractor}|{video_model_name or ''}"
     digest = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
-    return Path(cache_dir) / feature_extractor / f"{digest}.npy"
+    return Path(cache_dir) / _feature_cache_namespace(feature_extractor, video_model_name) / f"{digest}.npy"
 
 
 def load_image_vector_pretrained_cached(
     image_path: str | Path,
     feature_extractor: str = "resnet50",
     cache_dir: str | Path | None = None,
+    video_model_name: str = DEFAULT_VIDEOMAE_MODEL_NAME,
 ) -> np.ndarray:
     if cache_dir is None:
+        if feature_extractor == "videomae":
+            return load_video_vector_videomae(image_path, model_name=video_model_name)
+        if _is_video_feature_extractor(feature_extractor):
+            return load_video_vector_pretrained(image_path, feature_extractor=feature_extractor)
         return load_image_vector_pretrained(image_path, feature_extractor=feature_extractor)
 
-    cache_path = _embedding_cache_path(image_path, feature_extractor, cache_dir)
+    cache_path = _embedding_cache_path(
+        image_path,
+        feature_extractor,
+        cache_dir,
+        video_model_name=video_model_name if feature_extractor == "videomae" else None,
+    )
     if cache_path.exists():
         return np.load(cache_path).astype(np.float32)
 
-    embedding = load_image_vector_pretrained(image_path, feature_extractor=feature_extractor)
+    if feature_extractor == "videomae":
+        embedding = load_video_vector_videomae(image_path, model_name=video_model_name)
+    elif _is_video_feature_extractor(feature_extractor):
+        embedding = load_video_vector_pretrained(image_path, feature_extractor=feature_extractor)
+    else:
+        embedding = load_image_vector_pretrained(image_path, feature_extractor=feature_extractor)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     np.save(cache_path, embedding)
     return embedding
@@ -193,6 +366,7 @@ def build_feature_matrix(
     use_pretrained: bool = True,
     feature_extractor: str = "resnet50",
     cache_dir: str | Path | None = None,
+    video_model_name: str = DEFAULT_VIDEOMAE_MODEL_NAME,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Build feature matrix from images.
@@ -202,8 +376,9 @@ def build_feature_matrix(
         image_size: Size for traditional HOG features (ignored if use_pretrained=True)
         color_mode: 'rgb' or 'grayscale' (ignored if use_pretrained=True)
         use_pretrained: If True, use CNN embeddings; else use HOG+color+edge
-        feature_extractor: CNN backbone to use for embeddings ('resnet50' or 'vgg16')
+        feature_extractor: backbone to use for embeddings ('resnet50', 'vgg16', 'r3d_18', 'r2plus1d_18' or 'videomae')
         cache_dir: Optional folder to cache embeddings and speed up repeated runs
+        video_model_name: Hugging Face model id used when feature_extractor='videomae'
     
     Returns:
         Tuple of (features array, labels array)
@@ -218,6 +393,7 @@ def build_feature_matrix(
                     row.path,
                     feature_extractor=feature_extractor,
                     cache_dir=cache_dir,
+                    video_model_name=video_model_name,
                 )
                 features.append(embedding)
                 if (idx + 1) % 50 == 0:

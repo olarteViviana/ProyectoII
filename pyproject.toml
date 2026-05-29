@@ -4,6 +4,7 @@ version = "0.1.0"
 requires-python = ">=3.11,<3.12"
 dependencies = [
     "certifi>=2026.4.22",
+    "fastapi>=0.136.1",
     "joblib>=1.5.2",
     "kagglehub>=0.3.13",
     "matplotlib>=3.10.9",
@@ -14,10 +15,13 @@ dependencies = [
     "pandas>=2.3,<3",
     "pillow>=12.0.0",
     "prefect>=3.4.12",
+    "python-multipart>=0.0.27",
     "scikit-learn>=1.8.0",
     "streamlit>=1.57.0",
     "torch>=2.0,<2.11",
     "torchvision>=0.15,<0.16",
+    "transformers>=4.30.0,<4.45",
+    "uvicorn>=0.46.0",
 ]
 
 [project.scripts]
@@ -26,6 +30,7 @@ ucf-manifest = "ucf_crime_recognition.manifest:main"
 ucf-train = "ucf_crime_recognition.train:main"
 ucf-predict = "ucf_crime_recognition.predict:main"
 ucf-flow = "ucf_crime_recognition.pipeline:main"
+ucf-api = "ucf_crime_recognition.api.main:main"
 
 [build-system]
 requires = ["setuptools>=80.9.0"]
