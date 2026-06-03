@@ -33,7 +33,7 @@ class VideoMaeExtractorTests(unittest.TestCase):
         self.assertTrue(_is_video_feature_extractor("videomae"))
         self.assertEqual(_pretrained_embedding_dim("videomae"), 768)
 
-    def test_build_feature_matrix_passes_videomae_model_name(self):
+    def test_build_feature_matrix_passes_videomae_batch_options(self):
         manifest = pd.DataFrame(
             [
                 {"path": "clip_001.png", "label": "Fighting"},
@@ -41,19 +41,25 @@ class VideoMaeExtractorTests(unittest.TestCase):
             ]
         )
 
-        with patch("ucf_crime_recognition.features.engineering.load_image_vector_pretrained_cached") as loader:
-            loader.return_value = np.ones(768, dtype=np.float32)
+        with patch("ucf_crime_recognition.features.engineering.load_video_vectors_videomae_cached_batch") as loader:
+            loader.return_value = [
+                np.ones(768, dtype=np.float32),
+                np.full(768, 2.0, dtype=np.float32),
+            ]
             features, labels = build_feature_matrix(
                 manifest,
                 image_size=96,
                 color_mode="rgb",
                 feature_extractor="videomae",
                 video_model_name="test/videomae",
+                videomae_batch_size=2,
             )
 
         self.assertEqual(features.shape, (2, 768))
         self.assertEqual(labels.tolist(), ["Fighting", "NormalVideos"])
+        self.assertEqual(loader.call_args.args[0], ["clip_001.png", "clip_002.png"])
         self.assertEqual(loader.call_args.kwargs["video_model_name"], "test/videomae")
+        self.assertEqual(loader.call_args.kwargs["batch_size"], 2)
 
     def test_predict_image_details_uses_videomae_vector_for_videomae_model(self):
         with tempfile.TemporaryDirectory() as temp_dir:

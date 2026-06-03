@@ -4,6 +4,7 @@ import hashlib
 import re
 from functools import lru_cache
 from pathlib import Path
+from typing import Sequence
 
 import cv2
 import numpy as np
@@ -17,6 +18,7 @@ import torchvision.transforms as transforms
 
 DEFAULT_VIDEOMAE_MODEL_NAME = "MCG-NJU/videomae-base-finetuned-kinetics"
 VIDEOMAE_EMBEDDING_DIM = 768
+DEFAULT_VIDEOMAE_BATCH_SIZE = 4
 
 
 @lru_cache(maxsize=32)
@@ -258,16 +260,38 @@ def load_video_vector_videomae(
     clip_len: int = 16,
 ) -> np.ndarray:
     """Extract a VideoMAE transformer embedding from a frame-centered clip."""
+    return load_video_vectors_videomae([anchor_path], model_name=model_name, clip_len=clip_len)[0]
+
+
+def load_video_vectors_videomae(
+    anchor_paths: Sequence[str | Path],
+    model_name: str = DEFAULT_VIDEOMAE_MODEL_NAME,
+    clip_len: int = 16,
+) -> list[np.ndarray]:
+    """Extract VideoMAE transformer embeddings for several frame-centered clips."""
+    if not anchor_paths:
+        return []
+
     processor, model, device = _get_videomae_model(model_name)
-    frames = _load_video_clip_frames(anchor_path, clip_len=clip_len)
-    inputs = processor(frames, return_tensors="pt")
-    pixel_values = inputs["pixel_values"].to(device)
+    videos = [_load_video_clip_frames(anchor_path, clip_len=clip_len) for anchor_path in anchor_paths]
+
+    try:
+        inputs = processor(videos, return_tensors="pt")
+        pixel_values = inputs["pixel_values"]
+    except Exception:
+        processed_videos = [
+            processor(frames, return_tensors="pt")["pixel_values"].squeeze(0)
+            for frames in videos
+        ]
+        pixel_values = torch.stack(processed_videos, dim=0)
+
+    pixel_values = pixel_values.to(device)
 
     with torch.no_grad():
         outputs = model(pixel_values=pixel_values)
-        embedding = outputs.last_hidden_state.mean(dim=1).squeeze(0).cpu().numpy()
+        embeddings = outputs.last_hidden_state.mean(dim=1).cpu().numpy()
 
-    return embedding.astype(np.float32)
+    return [embedding.astype(np.float32) for embedding in embeddings]
 
 
 def _feature_cache_namespace(feature_extractor: str, video_model_name: str | None = None) -> str:
@@ -326,6 +350,60 @@ def load_image_vector_pretrained_cached(
     return embedding
 
 
+def load_video_vectors_videomae_cached_batch(
+    anchor_paths: Sequence[str | Path],
+    cache_dir: str | Path | None = None,
+    video_model_name: str = DEFAULT_VIDEOMAE_MODEL_NAME,
+    batch_size: int = DEFAULT_VIDEOMAE_BATCH_SIZE,
+) -> list[np.ndarray]:
+    paths = list(anchor_paths)
+    if not paths:
+        return []
+
+    batch_size = max(1, int(batch_size))
+    if cache_dir is None:
+        embeddings = []
+        for start in range(0, len(paths), batch_size):
+            embeddings.extend(
+                load_video_vectors_videomae(
+                    paths[start : start + batch_size],
+                    model_name=video_model_name,
+                )
+            )
+        return embeddings
+
+    cached_embeddings: list[np.ndarray | None] = [None] * len(paths)
+    missing_by_cache_path: dict[Path, tuple[Path, list[int]]] = {}
+    for index, path in enumerate(paths):
+        cache_path = _embedding_cache_path(
+            path,
+            "videomae",
+            cache_dir,
+            video_model_name=video_model_name,
+        )
+        if cache_path.exists():
+            cached_embeddings[index] = np.load(cache_path).astype(np.float32)
+        else:
+            if cache_path not in missing_by_cache_path:
+                missing_by_cache_path[cache_path] = (Path(path), [])
+            missing_by_cache_path[cache_path][1].append(index)
+
+    missing = list(missing_by_cache_path.items())
+    for start in range(0, len(missing), batch_size):
+        chunk = missing[start : start + batch_size]
+        chunk_embeddings = load_video_vectors_videomae(
+            [path for _, (path, _) in chunk],
+            model_name=video_model_name,
+        )
+        for (cache_path, (_, indexes)), embedding in zip(chunk, chunk_embeddings):
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            np.save(cache_path, embedding)
+            for index in indexes:
+                cached_embeddings[index] = embedding
+
+    return [embedding if embedding is not None else np.zeros(VIDEOMAE_EMBEDDING_DIM, dtype=np.float32) for embedding in cached_embeddings]
+
+
 def load_image_vector(image_path: str | Path, image_size: int, color_mode: str) -> np.ndarray:
     mode = "RGB" if color_mode == "rgb" else "L"
 
@@ -367,6 +445,7 @@ def build_feature_matrix(
     feature_extractor: str = "resnet50",
     cache_dir: str | Path | None = None,
     video_model_name: str = DEFAULT_VIDEOMAE_MODEL_NAME,
+    videomae_batch_size: int = DEFAULT_VIDEOMAE_BATCH_SIZE,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Build feature matrix from images.
@@ -379,6 +458,7 @@ def build_feature_matrix(
         feature_extractor: backbone to use for embeddings ('resnet50', 'vgg16', 'r3d_18', 'r2plus1d_18' or 'videomae')
         cache_dir: Optional folder to cache embeddings and speed up repeated runs
         video_model_name: Hugging Face model id used when feature_extractor='videomae'
+        videomae_batch_size: Number of clips processed together when using VideoMAE
     
     Returns:
         Tuple of (features array, labels array)
@@ -387,6 +467,43 @@ def build_feature_matrix(
         embedding_dim = _pretrained_embedding_dim(feature_extractor)
         print(f"Loading {feature_extractor} pretrained model...")
         features = []
+        if feature_extractor == "videomae":
+            paths = manifest["path"].tolist()
+            batch_size = max(1, int(videomae_batch_size))
+            for start in range(0, len(paths), batch_size):
+                chunk_paths = paths[start : start + batch_size]
+                try:
+                    features.extend(
+                        load_video_vectors_videomae_cached_batch(
+                            chunk_paths,
+                            cache_dir=cache_dir,
+                            video_model_name=video_model_name,
+                            batch_size=batch_size,
+                        )
+                    )
+                except Exception as batch_error:
+                    print(f"  Warning: batch failed for rows {start + 1}-{start + len(chunk_paths)}: {batch_error}")
+                    for path in chunk_paths:
+                        try:
+                            features.append(
+                                load_image_vector_pretrained_cached(
+                                    path,
+                                    feature_extractor=feature_extractor,
+                                    cache_dir=cache_dir,
+                                    video_model_name=video_model_name,
+                                )
+                            )
+                        except Exception as error:
+                            print(f"  Warning: failed to process {path}: {error}")
+                            features.append(np.zeros(embedding_dim, dtype=np.float32))
+
+                processed = min(start + len(chunk_paths), len(paths))
+                if processed % 50 == 0 or processed == len(paths):
+                    print(f"  Processed {processed}/{len(manifest)} videos")
+
+            labels = manifest["label"].to_numpy()
+            return np.vstack(features), labels
+
         for idx, row in enumerate(manifest.itertuples(index=False)):
             try:
                 embedding = load_image_vector_pretrained_cached(

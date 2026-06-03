@@ -3,6 +3,7 @@ from __future__ import annotations
 from io import BytesIO
 import tempfile
 from pathlib import Path
+from datetime import datetime
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -33,6 +34,43 @@ CLIP_WINDOW_OPTIONS = {
 }
 REVIEW_WINDOW_SECONDS = 2.0
 GALLERY_COLUMNS = 4
+
+
+def _format_file_timestamp(path: Path) -> str:
+    if not path.exists():
+        return "Sin modelo"
+    return datetime.fromtimestamp(path.stat().st_mtime).strftime("%d %b %Y, %H:%M")
+
+
+def _model_state_key() -> str:
+    config = load_config()
+    model_path = project_path(config["model"]["output_path"])
+    try:
+        return f"{model_path}:{model_path.stat().st_mtime_ns}:{model_path.stat().st_size}"
+    except OSError:
+        return str(model_path)
+
+
+def _active_model_metadata(summary: pd.DataFrame | None) -> dict[str, str]:
+    config = load_config()
+    preprocessing = config.get("preprocessing", {})
+    model_path = project_path(config["model"]["output_path"])
+    best_row = None
+    if summary is not None and not summary.empty:
+        best_rows = summary[summary["is_best"] == True] if "is_best" in summary else summary
+        if best_rows.empty:
+            best_rows = summary
+        best_row = best_rows.iloc[0]
+
+    metadata = {
+        "extractor": str(preprocessing.get("feature_extractor", "desconocido")),
+        "model_name": str(best_row["model_name"]) if best_row is not None else "Sin resumen",
+        "updated_at": _format_file_timestamp(model_path),
+        "risk_f1": "N/D",
+    }
+    if best_row is not None and pd.notna(best_row.get("risk_f1_macro")):
+        metadata["risk_f1"] = f"{float(best_row['risk_f1_macro']):.3f}"
+    return metadata
 
 
 def _load_summary() -> pd.DataFrame | None:
@@ -153,6 +191,28 @@ def _save_upload(uploaded_file) -> Path:
     return temp_path
 
 
+def _uploaded_file_key(uploaded_file) -> str:
+    file_id = getattr(uploaded_file, "file_id", None)
+    file_size = getattr(uploaded_file, "size", None)
+    mime_type = getattr(uploaded_file, "type", "")
+    return f"{file_id or uploaded_file.name}:{file_size}:{mime_type}"
+
+
+def _save_upload_to_session(uploaded_file) -> Path:
+    upload_key = _uploaded_file_key(uploaded_file)
+    previous_key = st.session_state.get("uploaded_file_key")
+    previous_path = st.session_state.get("uploaded_file_path")
+    if previous_key == upload_key and previous_path and Path(str(previous_path)).exists():
+        return Path(str(previous_path))
+
+    temp_path = _save_upload(uploaded_file)
+    st.session_state["uploaded_file_key"] = upload_key
+    st.session_state["uploaded_file_path"] = str(temp_path)
+    st.session_state.pop("video_analysis_key", None)
+    st.session_state.pop("video_analysis_payload", None)
+    return temp_path
+
+
 def _is_video_file(uploaded_file) -> bool:
     return triage_service.is_video_file(uploaded_file)
 
@@ -270,10 +330,64 @@ def _build_clip_thumbnail(
     return thumbnail
 
 
+@st.cache_data(show_spinner=False)
+def _cached_clip_thumbnail_bytes(
+    anchor_path: str,
+    frame_size: tuple[int, int] = (240, 150),
+) -> bytes:
+    output = BytesIO()
+    _build_clip_thumbnail(anchor_path, frame_size=frame_size).save(output, format="JPEG", quality=86)
+    return output.getvalue()
+
+
+@st.cache_data(show_spinner=False)
+def _cached_clip_animation_bytes(
+    anchor_path: str,
+    fps: float | None,
+    clip_len: int = triage_service.VIDEO_CLIP_LEN,
+    frame_size: tuple[int, int] = (480, 300),
+) -> bytes:
+    return _build_clip_animation(anchor_path, fps=fps, clip_len=clip_len, frame_size=frame_size)
+
+
+@st.cache_data(show_spinner=False)
+def _cached_clip_contact_sheet_bytes(
+    anchor_path: str,
+    clip_len: int = triage_service.VIDEO_CLIP_LEN,
+    columns: int = 4,
+    thumbnail_size: tuple[int, int] = (150, 95),
+) -> bytes:
+    output = BytesIO()
+    sheet = _build_clip_contact_sheet(
+        anchor_path,
+        clip_len=clip_len,
+        columns=columns,
+        thumbnail_size=thumbnail_size,
+    )
+    sheet.save(output, format="PNG")
+    return output.getvalue()
+
+
 def _video_format(video_path: Path) -> str:
     if video_path.suffix.lower() == ".mp4":
         return "video/mp4"
     return "video/x-msvideo"
+
+
+@st.cache_data(show_spinner=False)
+def _cached_video_segment_bytes(
+    video_path: str,
+    start_frame: int,
+    end_frame: int,
+    video_mtime_ns: int,
+) -> tuple[bytes, str]:
+    del video_mtime_ns
+    segment_path = triage_service.export_video_segment(
+        Path(video_path),
+        start_frame=start_frame,
+        end_frame=end_frame,
+    )
+    return segment_path.read_bytes(), _video_format(segment_path)
 
 
 def _numeric_value(value) -> float | None:
@@ -317,14 +431,15 @@ def _render_original_video_window(selected_clip: pd.Series) -> None:
     video_fps = _numeric_value(selected_clip.get("video_fps"))
     if clip_start_frame is not None and clip_end_frame is not None:
         try:
-            segment_path = triage_service.export_video_segment(
-                path,
-                start_frame=int(clip_start_frame),
-                end_frame=int(clip_end_frame),
+            segment_bytes, segment_format = _cached_video_segment_bytes(
+                str(path),
+                int(clip_start_frame),
+                int(clip_end_frame),
+                path.stat().st_mtime_ns,
             )
             st.video(
-                segment_path.read_bytes(),
-                format=_video_format(segment_path),
+                segment_bytes,
+                format=segment_format,
                 width="stretch",
             )
             return
@@ -352,12 +467,14 @@ def _render_clip_gallery(ranked_clips: pd.DataFrame, gallery_count: int) -> None
         cols = st.columns(GALLERY_COLUMNS)
         for column, (_, clip) in zip(cols, preview_clips.iloc[start : start + GALLERY_COLUMNS].iterrows()):
             with column:
-                st.image(_build_clip_thumbnail(clip["image_path"]), width="stretch")
+                st.markdown('<div class="clip-tile">', unsafe_allow_html=True)
+                st.image(_cached_clip_thumbnail_bytes(str(clip["image_path"])), width="stretch")
                 st.caption(
                     f"{clip['timestamp_s']:.2f}s | "
                     f"{clip['top_risk_class']} {_format_percent(clip['top_risk_probability'])} | "
                     f"mov {_format_percent(clip.get('motion_score', 0.0))}"
                 )
+                st.markdown('</div>', unsafe_allow_html=True)
 
 
 def _render_clip_inspector(event_table: pd.DataFrame) -> None:
@@ -400,15 +517,16 @@ def _render_clip_inspector(event_table: pd.DataFrame) -> None:
 
         st.caption("Clip técnico de 16 frames usado por el modelo")
         clip_duration = float(selected_clip.get("clip_duration_seconds") or 0.0)
-        animation = _build_clip_animation(
-            selected_clip["image_path"],
-            fps=_clip_effective_fps(selected_clip),
+        effective_fps = _clip_effective_fps(selected_clip)
+        animation = _cached_clip_animation_bytes(
+            str(selected_clip["image_path"]),
+            fps=round(effective_fps, 3) if effective_fps is not None else None,
         )
         if animation:
             st.image(animation, width="stretch")
 
         with st.expander("Ver frames del clip"):
-            sheet = _build_clip_contact_sheet(selected_clip["image_path"])
+            sheet = _cached_clip_contact_sheet_bytes(str(selected_clip["image_path"]))
             st.image(sheet, width="stretch")
 
         cols = st.columns(6)
@@ -424,78 +542,219 @@ def _apply_styles() -> None:
     st.markdown(
         """
         <style>
+        :root {
+            --surface: #ffffff;
+            --surface-muted: #f4f7fb;
+            --ink: #17202a;
+            --muted: #667085;
+            --line: #d9e1ec;
+            --accent: #2563eb;
+            --accent-2: #0f766e;
+            --warning: #b45309;
+            --danger: #b91c1c;
+        }
         .stApp {
-            background: #f5f7fb;
-            color: #0f172a;
+            background: linear-gradient(180deg, #eef3f8 0, #f7f9fc 220px, #f7f9fc 100%);
+            color: var(--ink);
         }
         [data-testid="stHeader"] {
-            background: rgba(245, 247, 251, 0.92);
+            background: rgba(247, 249, 252, 0.92);
+            backdrop-filter: blur(14px);
+        }
+        section[data-testid="stSidebar"] {
+            background: #111827;
+            border-right: 1px solid rgba(255, 255, 255, 0.08);
+        }
+        section[data-testid="stSidebar"] * {
+            color: #e5e7eb;
+        }
+        section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p {
+            color: #cbd5e1;
         }
         .hero {
-            padding: 1.35rem 1.5rem;
+            padding: 1.15rem 1.35rem;
             border-radius: 8px;
-            background: #101827;
-            color: #f8fafc;
-            border: 1px solid rgba(15, 23, 42, 0.12);
+            background:
+                linear-gradient(135deg, rgba(23, 32, 42, 0.98), rgba(15, 118, 110, 0.92)),
+                #17202a;
+            color: #ffffff;
+            border: 1px solid rgba(255, 255, 255, 0.14);
             margin-bottom: 1rem;
+            box-shadow: 0 18px 45px rgba(23, 32, 42, 0.14);
         }
         .hero h1 {
             margin: 0;
-            font-size: 2rem;
+            font-size: 1.75rem;
             letter-spacing: 0;
         }
         .hero p {
             margin: 0.45rem 0 0 0;
-            max-width: 860px;
-            color: #cbd5e1;
+            max-width: 940px;
+            color: #dbeafe;
             font-size: 0.98rem;
             line-height: 1.5;
         }
-        .soft-card {
-            padding: 1rem;
+        .hero-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 1rem;
+            flex-wrap: wrap;
+        }
+        .hero-pills {
+            display: flex;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+            justify-content: flex-end;
+        }
+        .status-pill {
+            display: inline-flex;
+            align-items: center;
+            min-height: 2rem;
+            padding: 0.35rem 0.65rem;
+            border-radius: 999px;
+            background: rgba(255, 255, 255, 0.12);
+            border: 1px solid rgba(255, 255, 255, 0.18);
+            color: #ffffff;
+            font-size: 0.82rem;
+            font-weight: 650;
+            white-space: nowrap;
+        }
+        .status-strip {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 0.75rem;
+            margin: 0.75rem 0 1rem 0;
+        }
+        .status-card {
+            min-height: 92px;
+            padding: 0.9rem 1rem;
             border-radius: 8px;
-            background: #ffffff;
-            border: 1px solid #d8dee9;
-            box-shadow: 0 8px 24px rgba(15, 23, 42, 0.05);
-            color: #0f172a;
+            background: var(--surface);
+            border: 1px solid var(--line);
+            box-shadow: 0 8px 22px rgba(23, 32, 42, 0.05);
+        }
+        .status-card span {
+            display: block;
+            color: var(--muted);
+            font-size: 0.78rem;
+            font-weight: 700;
+            text-transform: uppercase;
+        }
+        .status-card strong {
+            display: block;
+            color: var(--ink);
+            font-size: 1.1rem;
+            margin-top: 0.35rem;
+            word-break: break-word;
+        }
+        .soft-card {
+            padding: 1.05rem;
+            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.96);
+            border: 1px solid var(--line);
+            box-shadow: 0 12px 28px rgba(23, 32, 42, 0.06);
+            color: var(--ink);
+            margin-bottom: 1rem;
         }
         .small-label {
             text-transform: uppercase;
-            letter-spacing: 0.08em;
+            letter-spacing: 0;
             font-size: 0.72rem;
             font-weight: 700;
-            color: #475569;
+            color: var(--accent-2);
+            margin-bottom: 0.2rem;
+        }
+        .section-title {
+            margin: 0.15rem 0 0.8rem 0;
+            font-size: 1.28rem;
+            font-weight: 760;
+            color: var(--ink);
+        }
+        .empty-state {
+            padding: 1rem;
+            border-radius: 8px;
+            border: 1px dashed #b8c4d6;
+            background: #f8fafc;
+            color: #475467;
+            margin-top: 0.75rem;
         }
         .business-note {
             padding: 0.9rem 1rem;
-            border-left: 4px solid #2563eb;
-            background: #eff6ff;
+            border-left: 4px solid var(--accent-2);
+            background: #eefaf8;
             border-radius: 0 8px 8px 0;
-            color: #172554;
+            color: #134e4a;
         }
         div[data-testid="stMetric"] {
-            background: #ffffff;
-            border: 1px solid #d8dee9;
+            background: var(--surface);
+            border: 1px solid var(--line);
             border-radius: 8px;
             padding: 0.8rem 0.9rem;
+            box-shadow: 0 8px 18px rgba(23, 32, 42, 0.045);
         }
         div[data-testid="stMetric"] label {
-            color: #475569;
+            color: var(--muted);
         }
         div[data-testid="stMetricValue"] {
-            color: #0f172a;
+            color: var(--ink);
+            font-size: 1.32rem;
         }
         .stDataFrame {
-            border: 1px solid #d8dee9;
+            border: 1px solid var(--line);
             border-radius: 8px;
+        }
+        div[data-testid="stFileUploader"] {
+            border: 1px dashed #9fb0c7;
+            border-radius: 8px;
+            background: #f8fafc;
+            padding: 0.35rem 0.6rem 0.7rem 0.6rem;
+        }
+        .stButton > button,
+        div[data-testid="stBaseButton-secondary"] button {
+            border-radius: 8px;
+        }
+        div[data-testid="stExpander"] {
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            background: var(--surface);
+        }
+        .clip-tile img {
+            border-radius: 8px;
+            border: 1px solid var(--line);
         }
         .decision-note {
             padding: 0.9rem 1rem;
             border-radius: 8px;
             background: #fff7ed;
             border: 1px solid #fed7aa;
-            color: #7c2d12;
+            color: var(--warning);
             margin: 0.6rem 0 0.8rem 0;
+        }
+        .recommendation-box {
+            padding: 0.95rem 1rem;
+            border-radius: 8px;
+            background: #ecfdf3;
+            border: 1px solid #bbf7d0;
+            color: #166534;
+            font-weight: 700;
+            margin: 0.7rem 0 0.85rem 0;
+        }
+        hr {
+            margin: 1rem 0;
+        }
+        @media (max-width: 900px) {
+            .status-strip {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+        }
+        @media (max-width: 640px) {
+            .status-strip {
+                grid-template-columns: 1fr;
+            }
+            .hero h1 {
+                font-size: 1.45rem;
+            }
         }
         </style>
         """,
@@ -504,16 +763,239 @@ def _apply_styles() -> None:
 
 
 def _render_kpis(summary: pd.DataFrame | None) -> None:
-    cols = st.columns(4)
-    cols[0].metric("Modelo activo", "Optuna + MLflow", help="Entrena y selecciona el mejor candidato automáticamente.")
-    cols[1].metric("Supervisión", "Incidentes", help="Pensado para triage operativo y revisión rápida.")
-    if summary is not None and not summary.empty:
-        best_row = summary.sort_values("validation_f1_macro", ascending=False).iloc[0]
-        cols[2].metric("Mejor validación", f"{best_row['validation_f1_macro']:.3f}")
-        cols[3].metric("Candidato líder", best_row["model_name"])
-    else:
-        cols[2].metric("Mejor validación", "N/D")
-        cols[3].metric("Candidato líder", "N/D")
+    metadata = _active_model_metadata(summary)
+    validation_value = "N/D"
+    if summary is not None and not summary.empty and "validation_f1_macro" in summary:
+        validation_value = f"{float(summary['validation_f1_macro'].max()):.3f}"
+    st.markdown(
+        f"""
+        <div class="status-strip">
+            <div class="status-card"><span>Extractor</span><strong>{metadata["extractor"]}</strong></div>
+            <div class="status-card"><span>Modelo líder</span><strong>{metadata["model_name"]}</strong></div>
+            <div class="status-card"><span>F1 validación</span><strong>{validation_value}</strong></div>
+            <div class="status-card"><span>Actualizado</span><strong>{metadata["updated_at"]}</strong></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _video_analysis_key(
+    upload_key: str,
+    frame_samples: int,
+    clip_window_seconds: float,
+    motion_priority: bool,
+) -> str:
+    return (
+        f"{upload_key}|samples={frame_samples}|window={clip_window_seconds:.3f}|"
+        f"motion={int(motion_priority)}|model={_model_state_key()}"
+    )
+
+
+def _run_video_analysis(
+    temp_path: Path,
+    frame_samples: int,
+    clip_window_seconds: float,
+    motion_priority: bool,
+) -> tuple[list[dict], dict]:
+    with st.spinner("Detectando movimiento y extrayendo clips..."):
+        frames = triage_service.extract_sampled_frames(
+            temp_path,
+            frame_samples=frame_samples,
+            clip_window_seconds=clip_window_seconds,
+            motion_priority=motion_priority,
+        )
+        frames = triage_service.normalize_motion_scores(frames)
+
+    frame_results: list[dict] = []
+    prediction_progress = st.progress(0)
+    for position, frame in enumerate(frames, start=1):
+        prediction = predict_image_details(frame["image_path"])
+        raw_label = prediction["prediction"]
+        raw_confidence = float(prediction["confidence"])
+        raw_class_scores = prediction.get("class_scores", {})
+        motion_intensity = float(frame.get("motion_intensity") or 0.0)
+        class_scores = triage_service.adjust_class_scores_for_motion(
+            raw_class_scores,
+            motion_intensity,
+        )
+        label, confidence = triage_service.motion_adjusted_prediction_label(
+            raw_label,
+            class_scores,
+            motion_intensity,
+        )
+        if confidence == 0.0:
+            confidence = raw_confidence
+        risk_class, risk_probability = _risk_signal_from_scores(class_scores)
+        tier, score, recommendation = _risk_profile(label, confidence)
+        frame_results.append(
+            {
+                "timestamp_s": round(frame["timestamp_seconds"], 2),
+                "frame_index": frame["frame_index"],
+                "clip_start_frame": frame.get("clip_start_frame"),
+                "clip_end_frame": frame.get("clip_end_frame"),
+                "clip_duration_seconds": frame.get("clip_duration_seconds"),
+                "clip_window_seconds": frame.get("clip_window_seconds"),
+                "video_fps": frame.get("video_fps"),
+                "motion_score": frame.get("motion_score", 0.0),
+                "motion_intensity": motion_intensity,
+                "sampling_reason": frame.get("sampling_reason", "cobertura"),
+                "image_path": str(frame["image_path"]),
+                "source_video_path": str(temp_path),
+                "prediction": label,
+                "raw_prediction": raw_label,
+                "active_labels": label,
+                "confidence": confidence,
+                "normal_probability": float(class_scores.get(triage_service.NORMAL_LABEL, 0.0)),
+                "raw_normal_probability": float(raw_class_scores.get(triage_service.NORMAL_LABEL, 0.0)),
+                "top_risk_class": risk_class,
+                "top_risk_probability": risk_probability,
+                "class_scores": class_scores,
+                "raw_class_scores": raw_class_scores,
+                "tier": tier,
+                "score": score,
+                "recommendation": recommendation,
+            }
+        )
+        prediction_progress.progress(position / max(len(frames), 1))
+    prediction_progress.empty()
+
+    return frame_results, _aggregate_video_predictions(frame_results)
+
+
+def _render_video_analysis_results(frame_results: list[dict], aggregate: dict) -> None:
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Decisión operativa", aggregate["prediction"])
+    m2.metric("Evidencia del evento", _format_percent(aggregate["confidence"]))
+    m3.metric("Clips evaluados", len(frame_results))
+    m4.metric("Pico mayor", _format_percent(aggregate["probability_leader_confidence"]))
+
+    st.markdown(_incident_summary(aggregate["prediction"], aggregate["confidence"]))
+    st.markdown(
+        f"""
+        <div class="decision-note">
+        <strong>Por qué la decisión puede diferir del máximo bruto:</strong><br>
+        {aggregate["decision_note"]}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f'<div class="recommendation-box">Recomendación operativa: {aggregate["recommendation"]}</div>',
+        unsafe_allow_html=True,
+    )
+
+    if not aggregate["class_summary"].empty:
+        st.caption("Evidencia agregada por clase con ajuste operativo")
+        display_summary = aggregate["class_summary"][
+            [
+                "selected",
+                "class_name",
+                "mean_probability",
+                "max_probability",
+                "frame_hits",
+                "decision_score",
+            ]
+        ].rename(
+            columns={
+                "selected": "decisión",
+                "class_name": "clase",
+                "mean_probability": "prob. media",
+                "max_probability": "prob. máxima",
+                "frame_hits": "clips con señal",
+                "decision_score": "score operativo",
+            }
+        )
+        display_summary["decisión"] = display_summary["decisión"].map(
+            {True: "Seleccionada", False: ""}
+        )
+        display_summary = display_summary.sort_values(
+            ["decisión", "score operativo", "prob. máxima"],
+            ascending=[False, False, False],
+        )
+        st.dataframe(display_summary, width="stretch", hide_index=True)
+
+    event_table = pd.DataFrame(frame_results)
+    st.caption("Timeline multi-etiqueta por clip")
+    st.dataframe(
+        event_table[
+            [
+                "timestamp_s",
+                "clip_start_frame",
+                "clip_end_frame",
+                "clip_duration_seconds",
+                "motion_score",
+                "motion_intensity",
+                "sampling_reason",
+                "raw_prediction",
+                "active_labels",
+                "raw_normal_probability",
+                "normal_probability",
+                "top_risk_class",
+                "top_risk_probability",
+                "tier",
+                "score",
+            ]
+        ]
+        .rename(
+            columns={
+                "timestamp_s": "tiempo (s)",
+                "clip_start_frame": "inicio clip",
+                "clip_end_frame": "fin clip",
+                "clip_duration_seconds": "duración clip (s)",
+                "motion_score": "movimiento",
+                "motion_intensity": "mov. relativa",
+                "sampling_reason": "muestreo",
+                "raw_prediction": "pred. bruta",
+                "active_labels": "etiquetas activas",
+                "raw_normal_probability": "Normal bruto",
+                "normal_probability": "Normal ajustado",
+                "top_risk_class": "mayor riesgo",
+                "top_risk_probability": "score mayor riesgo",
+                "tier": "nivel",
+                "score": "severidad",
+            }
+        )
+        .sort_values("tiempo (s)"),
+        width="stretch",
+        hide_index=True,
+    )
+
+    key_moments = event_table.sort_values("top_risk_probability", ascending=False).head(3)
+    st.caption("Momentos clave por señal de riesgo")
+    st.dataframe(
+        key_moments[
+            [
+                "timestamp_s",
+                "top_risk_class",
+                "top_risk_probability",
+                "normal_probability",
+                "active_labels",
+                "recommendation",
+            ]
+        ].rename(
+            columns={
+                "timestamp_s": "tiempo (s)",
+                "top_risk_class": "mayor riesgo",
+                "top_risk_probability": "score riesgo",
+                "normal_probability": "score NormalVideos",
+                "active_labels": "etiquetas activas",
+                "recommendation": "recomendación",
+            }
+        ),
+        width="stretch",
+        hide_index=True,
+    )
+
+    _render_clip_inspector(event_table)
+
+    if not aggregate["class_summary"].empty:
+        st.caption("Histograma de score operativo")
+        _render_score_histogram(
+            aggregate["class_summary"]["decision_score"],
+            aggregate["class_summary"]["class_name"],
+            "Distribución de evidencia operativa por clase",
+        )
 
 
 def _render_experiment_panel(summary: pd.DataFrame | None, report_text: str | None) -> None:
@@ -521,10 +1003,10 @@ def _render_experiment_panel(summary: pd.DataFrame | None, report_text: str | No
     with left:
         st.markdown('<div class="soft-card">', unsafe_allow_html=True)
         st.markdown('<div class="small-label">Triage de incidente</div>', unsafe_allow_html=True)
-        st.subheader("Sube un video o una imagen y recibe una decisión operativa")
+        st.markdown('<div class="section-title">Revisión de evidencia</div>', unsafe_allow_html=True)
         uploaded = st.file_uploader("Archivo del incidente", type=["png", "jpg", "jpeg", "webp", "bmp", "mp4", "mov", "avi", "mkv", "webm"])
         if uploaded is not None:
-            temp_path = _save_upload(uploaded)
+            temp_path = _save_upload_to_session(uploaded)
             if _is_video_file(uploaded):
                 coverage_label = st.segmented_control(
                     "Cobertura temporal",
@@ -545,205 +1027,37 @@ def _render_experiment_panel(summary: pd.DataFrame | None, report_text: str | No
                 )
                 motion_priority = st.checkbox("Priorizar movimiento", value=triage_service.MOTION_PRIORITY)
                 st.video(temp_path.read_bytes())
-                try:
-                    with st.spinner("Detectando movimiento y extrayendo clips..."):
-                        frames = triage_service.extract_sampled_frames(
+                analysis_key = _video_analysis_key(
+                    str(st.session_state.get("uploaded_file_key", "")),
+                    frame_samples,
+                    clip_window_seconds,
+                    motion_priority,
+                )
+                force_reanalysis = st.button("Reanalizar video", type="secondary", use_container_width=True)
+                cached_payload = st.session_state.get("video_analysis_payload")
+                cached_key = st.session_state.get("video_analysis_key")
+                if cached_payload and cached_key == analysis_key and not force_reanalysis:
+                    st.caption("Resultados cargados desde la sesión. Cambiar de clip no recalcula el modelo.")
+                    _render_video_analysis_results(
+                        cached_payload["frame_results"],
+                        cached_payload["aggregate"],
+                    )
+                else:
+                    try:
+                        frame_results, aggregate = _run_video_analysis(
                             temp_path,
                             frame_samples=frame_samples,
                             clip_window_seconds=clip_window_seconds,
                             motion_priority=motion_priority,
                         )
-                        frames = triage_service.normalize_motion_scores(frames)
-                    frame_results: list[dict] = []
-
-                    prediction_progress = st.progress(0)
-                    for position, frame in enumerate(frames, start=1):
-                        prediction = predict_image_details(frame["image_path"])
-                        raw_label = prediction["prediction"]
-                        raw_confidence = float(prediction["confidence"])
-                        raw_class_scores = prediction.get("class_scores", {})
-                        motion_intensity = float(frame.get("motion_intensity") or 0.0)
-                        class_scores = triage_service.adjust_class_scores_for_motion(
-                            raw_class_scores,
-                            motion_intensity,
-                        )
-                        label, confidence = triage_service.motion_adjusted_prediction_label(
-                            raw_label,
-                            class_scores,
-                            motion_intensity,
-                        )
-                        if confidence == 0.0:
-                            confidence = raw_confidence
-                        risk_class, risk_probability = _risk_signal_from_scores(class_scores)
-                        tier, score, recommendation = _risk_profile(label, confidence)
-                        frame_results.append(
-                            {
-                                "timestamp_s": round(frame["timestamp_seconds"], 2),
-                                "frame_index": frame["frame_index"],
-                                "clip_start_frame": frame.get("clip_start_frame"),
-                                "clip_end_frame": frame.get("clip_end_frame"),
-                                "clip_duration_seconds": frame.get("clip_duration_seconds"),
-                                "clip_window_seconds": frame.get("clip_window_seconds"),
-                                "video_fps": frame.get("video_fps"),
-                                "motion_score": frame.get("motion_score", 0.0),
-                                "motion_intensity": motion_intensity,
-                                "sampling_reason": frame.get("sampling_reason", "cobertura"),
-                                "image_path": str(frame["image_path"]),
-                                "source_video_path": str(temp_path),
-                                "prediction": label,
-                                "raw_prediction": raw_label,
-                                "active_labels": label,
-                                "confidence": confidence,
-                                "normal_probability": float(class_scores.get(triage_service.NORMAL_LABEL, 0.0)),
-                                "raw_normal_probability": float(raw_class_scores.get(triage_service.NORMAL_LABEL, 0.0)),
-                                "top_risk_class": risk_class,
-                                "top_risk_probability": risk_probability,
-                                "class_scores": class_scores,
-                                "raw_class_scores": raw_class_scores,
-                                "tier": tier,
-                                "score": score,
-                                "recommendation": recommendation,
-                            }
-                        )
-                        prediction_progress.progress(position / max(len(frames), 1))
-                    prediction_progress.empty()
-
-                    aggregate = _aggregate_video_predictions(frame_results)
-                    m1, m2, m3, m4 = st.columns(4)
-                    m1.metric("Decisión operativa", aggregate["prediction"])
-                    m2.metric("Evidencia del evento", _format_percent(aggregate["confidence"]))
-                    m3.metric("Clips evaluados", len(frame_results))
-                    m4.metric("Pico mayor", _format_percent(aggregate["probability_leader_confidence"]))
-
-                    st.markdown(_incident_summary(aggregate["prediction"], aggregate["confidence"]))
-                    st.markdown(
-                        f"""
-                        <div class="decision-note">
-                        <strong>Por qué la decisión puede diferir del máximo bruto:</strong><br>
-                        {aggregate["decision_note"]}
-                        </div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
-                    st.success(f"Recomendación operativa: {aggregate['recommendation']}")
-
-                    if not aggregate["class_summary"].empty:
-                        st.caption("Evidencia agregada por clase con ajuste operativo")
-                        display_summary = aggregate["class_summary"][
-                            [
-                                "selected",
-                                "class_name",
-                                "mean_probability",
-                                "max_probability",
-                                "frame_hits",
-                                "decision_score",
-                            ]
-                        ].rename(
-                            columns={
-                                "selected": "decisión",
-                                "class_name": "clase",
-                                "mean_probability": "prob. media",
-                                "max_probability": "prob. máxima",
-                                "frame_hits": "clips con señal",
-                                "decision_score": "score operativo",
-                            }
-                        )
-                        display_summary["decisión"] = display_summary["decisión"].map(
-                            {True: "Seleccionada", False: ""}
-                        )
-                        display_summary = display_summary.sort_values(
-                            ["decisión", "score operativo", "prob. máxima"],
-                            ascending=[False, False, False],
-                        )
-                        st.dataframe(
-                            display_summary,
-                            width="stretch",
-                            hide_index=True,
-                        )
-
-                    event_table = pd.DataFrame(frame_results)
-                    st.caption("Timeline multi-etiqueta por clip")
-                    st.dataframe(
-                        event_table[
-                            [
-                                "timestamp_s",
-                                "clip_start_frame",
-                                "clip_end_frame",
-                                "clip_duration_seconds",
-                                "motion_score",
-                                "motion_intensity",
-                                "sampling_reason",
-                                "raw_prediction",
-                                "active_labels",
-                                "raw_normal_probability",
-                                "normal_probability",
-                                "top_risk_class",
-                                "top_risk_probability",
-                                "tier",
-                                "score",
-                            ]
-                        ]
-                        .rename(
-                            columns={
-                                "timestamp_s": "tiempo (s)",
-                                "clip_start_frame": "inicio clip",
-                                "clip_end_frame": "fin clip",
-                                "clip_duration_seconds": "duración clip (s)",
-                                "motion_score": "movimiento",
-                                "motion_intensity": "mov. relativa",
-                                "sampling_reason": "muestreo",
-                                "raw_prediction": "pred. bruta",
-                                "active_labels": "etiquetas activas",
-                                "raw_normal_probability": "Normal bruto",
-                                "normal_probability": "Normal ajustado",
-                                "top_risk_class": "mayor riesgo",
-                                "top_risk_probability": "score mayor riesgo",
-                                "tier": "nivel",
-                                "score": "severidad",
-                            }
-                        )
-                        .sort_values("tiempo (s)"),
-                        width="stretch",
-                        hide_index=True,
-                    )
-
-                    key_moments = event_table.sort_values("top_risk_probability", ascending=False).head(3)
-                    st.caption("Momentos clave por señal de riesgo")
-                    st.dataframe(
-                        key_moments[
-                            [
-                                "timestamp_s",
-                                "top_risk_class",
-                                "top_risk_probability",
-                                "normal_probability",
-                                "active_labels",
-                                "recommendation",
-                            ]
-                        ].rename(
-                            columns={
-                                "timestamp_s": "tiempo (s)",
-                                "top_risk_class": "mayor riesgo",
-                                "top_risk_probability": "score riesgo",
-                                "normal_probability": "score NormalVideos",
-                                "active_labels": "etiquetas activas",
-                                "recommendation": "recomendación",
-                            }
-                        ),
-                        width="stretch",
-                        hide_index=True,
-                    )
-
-                    _render_clip_inspector(event_table)
-
-                    if not aggregate["class_summary"].empty:
-                        st.caption("Histograma de score operativo")
-                        _render_score_histogram(
-                            aggregate["class_summary"]["decision_score"],
-                            aggregate["class_summary"]["class_name"],
-                            "Distribución de evidencia operativa por clase",
-                        )
-                except Exception as error:
-                    st.error(f"No se pudo evaluar el video: {error}")
+                        st.session_state["video_analysis_key"] = analysis_key
+                        st.session_state["video_analysis_payload"] = {
+                            "frame_results": frame_results,
+                            "aggregate": aggregate,
+                        }
+                        _render_video_analysis_results(frame_results, aggregate)
+                    except Exception as error:
+                        st.error(f"No se pudo evaluar el video: {error}")
             else:
                 image = Image.open(temp_path)
                 st.image(image, width="stretch")
@@ -776,36 +1090,53 @@ def _render_experiment_panel(summary: pd.DataFrame | None, report_text: str | No
                 except Exception as error:
                     st.error(f"No se pudo evaluar la imagen: {error}")
         else:
-            st.write("Carga una imagen o un video del incidente para obtener el triage.")
+            st.markdown(
+                """
+                <div class="empty-state">
+                    Carga una imagen o video para iniciar la revisión. Los resultados aparecerán aquí con decisión,
+                    evidencia agregada, timeline y clips evaluados.
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
         st.markdown('</div>', unsafe_allow_html=True)
     with right:
         st.markdown('<div class="soft-card">', unsafe_allow_html=True)
         st.markdown('<div class="small-label">Operación</div>', unsafe_allow_html=True)
-        st.subheader("Señales del negocio")
+        st.markdown('<div class="section-title">Estado del sistema</div>', unsafe_allow_html=True)
         st.markdown(
             """
             <div class="business-note">
-            <strong>Qué vende esta interfaz:</strong><br>
-            ahorro de tiempo para equipos de seguridad, menos revisión manual de video, y reportes listos para auditoría.
+            <strong>Modelo activo:</strong><br>
+            el pipeline entrenado en MLflow ya está conectado a esta interfaz para revisión de incidentes.
             </div>
             """,
             unsafe_allow_html=True,
         )
-        st.write("Casos de uso: tiendas, colegios, estacionamientos, bodegas y conjuntos residenciales.")
-        st.write("Modelo comercial sugerido: suscripción por cámara o por sitio con alertas y reportes premium.")
 
         if summary is not None and not summary.empty:
-            st.caption("Resumen del último entrenamiento")
-            latest = summary.sort_values("validation_f1_macro", ascending=False)
+            st.caption("Último entrenamiento")
+            latest = summary.sort_values("is_best", ascending=False) if "is_best" in summary else summary
+            summary_columns = [
+                column
+                for column in [
+                    "model_name",
+                    "validation_risk_f1_macro",
+                    "validation_f1_macro",
+                    "risk_f1_macro",
+                    "is_best",
+                ]
+                if column in latest
+            ]
             st.dataframe(
-                latest[["model_name", "validation_f1_macro", "validation_accuracy", "best_params"]],
+                latest[summary_columns],
                 width="stretch",
                 hide_index=True,
             )
 
         if report_text:
-            with st.expander("Ver reporte de clasificación"):
+            with st.expander("Reporte de clasificación"):
                 st.text(report_text)
         st.markdown('</div>', unsafe_allow_html=True)
 
@@ -817,11 +1148,17 @@ def main() -> None:
     st.markdown(
         f"""
         <div class="hero">
-            <h1>{APP_NAME}</h1>
-            <p>
-                Una interfaz de triage de incidentes para cámaras de seguridad. Sube una imagen,
-                clasifica el evento, prioriza la revisión y genera un resumen claro para el equipo operativo.
-            </p>
+            <div class="hero-row">
+                <div>
+                    <h1>{APP_NAME}</h1>
+                    <p>Panel de revisión de incidentes con análisis temporal, clips priorizados por movimiento y trazabilidad del modelo entrenado.</p>
+                </div>
+                <div class="hero-pills">
+                    <span class="status-pill">VideoMAE</span>
+                    <span class="status-pill">MLflow</span>
+                    <span class="status-pill">14 clases</span>
+                </div>
+            </div>
         </div>
         """,
         unsafe_allow_html=True,

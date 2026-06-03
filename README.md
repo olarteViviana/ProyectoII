@@ -215,3 +215,45 @@ uv run ucf-flow --rebuild-manifest
 ```
 
 La primera ejecucion descargara el checkpoint de Hugging Face y guardara embeddings en `data/processed/embeddings`, por lo que puede tardar bastante mas que una prediccion normal. Las siguientes ejecuciones reutilizan cache.
+
+## 13. Desplegar con Docker
+
+El proyecto incluye `Dockerfile` y `docker-compose.yml` para levantar la API, la interfaz Streamlit y MLflow con la misma imagen.
+
+Construir la imagen:
+
+```bash
+docker compose build
+```
+
+Levantar API, dashboard y MLflow:
+
+```bash
+docker compose up api dashboard mlflow
+```
+
+Servicios disponibles:
+
+- API REST: `http://localhost:8000/docs`
+- Streamlit: `http://localhost:8501`
+- MLflow: `http://localhost:5001`
+
+La imagen no empaqueta `data/`, `models/`, `reports/` ni `mlruns/`; Docker Compose los monta desde el proyecto local para reutilizar los artefactos entrenados y evitar imagenes pesadas. Si la API responde que no encuentra el modelo, verifica que exista `models/ucf_crime_baseline.joblib` o ejecuta entrenamiento.
+
+Entrenar desde Docker:
+
+```bash
+docker compose --profile train run --rm train
+```
+
+Ver logs:
+
+```bash
+docker compose logs -f api
+```
+
+Detener servicios:
+
+```bash
+docker compose down
+```

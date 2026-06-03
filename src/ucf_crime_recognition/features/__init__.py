@@ -4,6 +4,8 @@ from ucf_crime_recognition.features.engineering import (
 	load_image_vector_pretrained,
 	load_video_vector_pretrained,
 	load_video_vector_videomae,
+	load_video_vectors_videomae,
+	load_video_vectors_videomae_cached_batch,
 )
 
 __all__ = [
@@ -12,4 +14,6 @@ __all__ = [
 	"load_image_vector_pretrained",
 	"load_video_vector_pretrained",
 	"load_video_vector_videomae",
+	"load_video_vectors_videomae",
+	"load_video_vectors_videomae_cached_batch",
 ]

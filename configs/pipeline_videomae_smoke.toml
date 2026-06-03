@@ -11,46 +11,43 @@ video_model_name = "MCG-NJU/videomae-base-finetuned-kinetics"
 videomae_batch_size = 4
 embedding_cache_dir = "data/processed/embeddings"
 test_size = 0.2
-validation_size = 0.25
+validation_size = 0.05
 random_state = 42
 
 [model]
-output_path = "models/ucf_crime_baseline.joblib"
+output_path = "models/ucf_crime_videomae_smoke.joblib"
 multi_output = true
-max_iter = 300
+max_iter = 100
 class_weight = "balanced"
-max_train_samples = 10000
-max_validation_samples = 1200
-max_test_samples = 1200
-min_train_samples_per_class = 250
-max_train_samples_per_class = 800
+max_train_samples = 560
+max_validation_samples = 14
+max_test_samples = 14
+min_train_samples_per_class = 2
+max_train_samples_per_class = 2
 candidate_models = [
-    "logistic_regression",
-    "linear_svm",
     "extra_trees",
-    "random_forest",
 ]
 selection_metric = "risk_f1_macro"
 
 [model.threshold_search]
 min = 0.05
 max = 0.95
-steps = 19
+steps = 7
 
 [reports]
-classification_report = "reports/classification_report.txt"
-confusion_matrix = "reports/confusion_matrix.csv"
-experiment_summary = "reports/experiment_summary.csv"
+classification_report = "reports/classification_report_videomae_smoke.txt"
+confusion_matrix = "reports/confusion_matrix_videomae_smoke.csv"
+experiment_summary = "reports/experiment_summary_videomae_smoke.csv"
 
 [optuna]
-enabled = true
-n_trials = 48
-timeout_seconds = 1800
+enabled = false
+n_trials = 1
+timeout_seconds = 120
 
 [mlflow]
 tracking_uri = "sqlite:///mlflow.db"
-experiment_name = "ucf-crime-recognition"
+experiment_name = "ucf-crime-videomae-smoke"
 
 [registry]
-enabled = true
+enabled = false
 model_name = "ucf-crime-image-classifier"

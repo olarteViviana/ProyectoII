@@ -446,6 +446,7 @@ def train(config_path: str | Path | None = None) -> dict:
     color_mode = config["preprocessing"]["color_mode"]
     feature_extractor = config["preprocessing"].get("feature_extractor", "resnet50")
     video_model_name = config["preprocessing"].get("video_model_name", "MCG-NJU/videomae-base-finetuned-kinetics")
+    videomae_batch_size = config["preprocessing"].get("videomae_batch_size", 4)
     embedding_cache_dir = config["preprocessing"].get("embedding_cache_dir")
     embedding_cache_path = project_path(embedding_cache_dir) if embedding_cache_dir else None
 
@@ -456,6 +457,7 @@ def train(config_path: str | Path | None = None) -> dict:
         feature_extractor=feature_extractor,
         cache_dir=embedding_cache_path,
         video_model_name=video_model_name,
+        videomae_batch_size=videomae_batch_size,
     )
     x_validation, y_validation = build_feature_matrix(
         validation_manifest,
@@ -464,6 +466,7 @@ def train(config_path: str | Path | None = None) -> dict:
         feature_extractor=feature_extractor,
         cache_dir=embedding_cache_path,
         video_model_name=video_model_name,
+        videomae_batch_size=videomae_batch_size,
     )
     x_test, y_test = build_feature_matrix(
         test_manifest,
@@ -472,6 +475,7 @@ def train(config_path: str | Path | None = None) -> dict:
         feature_extractor=feature_extractor,
         cache_dir=embedding_cache_path,
         video_model_name=video_model_name,
+        videomae_batch_size=videomae_batch_size,
     )
 
     label_classes = None
